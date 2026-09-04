@@ -1,0 +1,22 @@
+[Unit]
+Description=Restricted workspace text file portal
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/file_portal
+Environment=FILE_PORTAL_BASE_PATH=/shell_file
+Environment=FILE_PORTAL_ROOTS=/tmp:/home/ubuntu/workspace
+Environment=FILE_PORTAL_PRESETS=/tmp|/home/ubuntu/workspace|__git__
+ExecStart=/usr/bin/python3 /home/ubuntu/file_portal/app.py
+Restart=always
+RestartSec=2
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/tmp /home/ubuntu/workspace
+
+[Install]
+WantedBy=multi-user.target

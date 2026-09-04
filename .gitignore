@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.new
+.env
+frpc*.toml
+openclaw*.conf
