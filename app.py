@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import zipfile
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +24,19 @@ ALLOWED_ROOTS = tuple(
 PATH_PRESETS = tuple(os.environ.get("FILE_PORTAL_PRESETS", "/tmp|/home/ubuntu/workspace|__git__").split("|"))
 DOWNLOADABLE_SUFFIXES = frozenset({".patch", ".md", ".txt"})
 MAX_DOWNLOAD_FILE_SIZE = 10 * 1024 * 1024
+LOG_FILE = Path(os.environ.get("FILE_PORTAL_LOG_FILE", "/tmp/file_portal.log"))
+
+
+def log_event(client_ip, event_type, details=""):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    detail_str = f" {details}" if details else ""
+    line = f"[{timestamp}] [{client_ip}] [{event_type}]{detail_str}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except OSError:
+        pass
 
 
 class PortalError(Exception):
@@ -142,7 +156,7 @@ def git_branches_for(root):
         result = subprocess.run(
             [
                 "git", "-C", str(root), "for-each-ref",
-                "--format=%(refname)", "refs/heads/", "refs/remotes/",
+                "--format=%(refname:short)", "refs/heads/",
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -155,22 +169,11 @@ def git_branches_for(root):
         return []
 
     local_branches = []
-    remote_branches = []
     for line in result.stdout.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if line.startswith("refs/heads/"):
-            local_branches.append(line[len("refs/heads/"):])
-        elif line.startswith("refs/remotes/"):
-            remote = line[len("refs/remotes/"): ]
-            if not remote.endswith("/HEAD"):
-                remote_branches.append(remote)
-
-    branches = []
-    for name in sorted(local_branches):
-        branches.append({"name": name, "group": "Local"})
-    for name in sorted(remote_branches):
-        branches.append({"name": name, "group": "Remote"})
-    return branches
+        name = line.strip()
+        if name:
+            local_branches.append({"name": name})
+    return sorted(local_branches, key=lambda item: item["name"].lower())
 
 
 def resolve_git_root(value):
@@ -214,8 +217,20 @@ def read_download_file(path):
 class Handler(BaseHTTPRequestHandler):
     server_version = "WorkspaceFilePortal/1.0"
 
+    def client_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        real_ip = self.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip.strip()
+        return self.address_string()
+
+    def log_action(self, event_type, details=""):
+        log_event(self.client_ip(), event_type, details)
+
     def log_message(self, format_string, *args):
-        print(f"{self.address_string()} - {format_string % args}", flush=True)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [{self.client_ip()}] [HTTP] {format_string % args}", flush=True)
 
     def do_GET(self):
         request = urlparse(self.path)
@@ -238,12 +253,15 @@ class Handler(BaseHTTPRequestHandler):
                 "roots": [str(root) for root in ALLOWED_ROOTS],
                 "presets": PATH_PRESETS,
             })
+        if request.path == f"{BASE_PATH}/api/logs":
+            return self.get_logs(request)
         return self.send_error_json(HTTPStatus.NOT_FOUND, "Not found.")
 
     def do_POST(self):
         request = urlparse(self.path)
         if request.path != f"{BASE_PATH}/api/file":
             return self.send_error_json(HTTPStatus.NOT_FOUND, "Not found.")
+        payload = None
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length > MAX_FILE_SIZE + 65536:
@@ -253,11 +271,35 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "Request body must be JSON.")
         except PortalError as error:
+            raw_path = payload.get("path") if isinstance(payload, dict) else None
+            self.send_error_json(error.status, error.message, path=raw_path)
+
+    def get_logs(self, request):
+        try:
+            query = parse_qs(request.query)
+            try:
+                limit = min(max(int(query.get("lines", ["100"])[0]), 1), 1000)
+            except ValueError:
+                limit = 100
+            lines = []
+            if LOG_FILE.exists():
+                try:
+                    with open(LOG_FILE, "r", encoding="utf-8", errors="replace") as f:
+                        all_lines = f.readlines()
+                        lines = [line.rstrip("\r\n") for line in all_lines[-limit:]]
+                except OSError as error:
+                    raise PortalError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Cannot read log file: {error}") from None
+            self.log_action("GET_LOGS", f"returned={len(lines)} limit={limit}")
+            self.send_json(HTTPStatus.OK, {"lines": lines, "total": len(lines)})
+        except PortalError as error:
             self.send_error_json(error.status, error.message)
 
     def list_directory(self, request):
+        raw_path = None
         try:
-            raw_path = parse_qs(request.query).get("path", [str(ALLOWED_ROOTS[0])])[0]
+            query = parse_qs(request.query)
+            raw_path = query.get("path", [str(ALLOWED_ROOTS[0])])[0]
+            action = query.get("action", ["browse"])[0]
             path = resolve_path(raw_path)
             if not path.is_dir():
                 raise PortalError(HTTPStatus.BAD_REQUEST, "Path is not a directory.")
@@ -292,6 +334,8 @@ class Handler(BaseHTTPRequestHandler):
             parent = str(path.parent) if path != next(root for root in ALLOWED_ROOTS if path == root or root in path.parents) else None
             git_root = git_root_for(path)
             git_branch = git_branch_for(git_root) if git_root else None
+            event_name = "REFRESH_DIR" if action == "refresh" else "LIST_DIR"
+            self.log_action(event_name, f"path={path} entries={len(entries)} gitRoot={git_root or 'none'}")
             self.send_json(HTTPStatus.OK, {
                 "path": str(path),
                 "parent": parent,
@@ -300,30 +344,39 @@ class Handler(BaseHTTPRequestHandler):
                 "gitBranch": git_branch,
             })
         except PortalError as error:
-            self.send_error_json(error.status, error.message)
+            self.send_error_json(error.status, error.message, path=raw_path)
 
     def read_file(self, request):
+        raw_path = None
         try:
-            raw_path = parse_qs(request.query).get("path", [None])[0]
+            query = parse_qs(request.query)
+            raw_path = query.get("path", [None])[0]
+            action = query.get("action", ["open"])[0]
             path = resolve_path(raw_path)
             content = ensure_text_file(path)
-            self.send_json(HTTPStatus.OK, {**metadata(path), "content": content})
+            meta = metadata(path)
+            event_name = "REFRESH_FILE" if action == "refresh" else ("RESTORE_FILE" if action == "restore" else "OPEN_FILE")
+            self.log_action(event_name, f"path={path} size={meta['size']} writable={meta['writable']}")
+            self.send_json(HTTPStatus.OK, {**meta, "content": content})
         except PortalError as error:
-            self.send_error_json(error.status, error.message)
+            self.send_error_json(error.status, error.message, path=raw_path)
 
     def download_path(self, request):
+        raw_path = None
         try:
             raw_path = parse_qs(request.query).get("path", [None])[0]
             path = resolve_path(raw_path)
             if path.is_file():
                 data = read_download_file(path)
+                self.log_action("DOWNLOAD", f"kind=file path={path} size={len(data)}")
                 self.send_download(data, path.name, "text/plain; charset=utf-8")
             elif path.is_dir():
+                self.log_action("DOWNLOAD", f"kind=directory path={path}")
                 self.download_directory(path)
             else:
                 raise PortalError(HTTPStatus.BAD_REQUEST, "Path is not a regular file or directory.")
         except PortalError as error:
-            self.send_error_json(error.status, error.message)
+            self.send_error_json(error.status, error.message, path=raw_path)
 
     def download_directory(self, directory):
         files = []
@@ -377,9 +430,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def list_commits(self, request):
+        raw_path = None
         try:
             query = parse_qs(request.query)
             raw_path = query.get("path", [None])[0]
+            action = query.get("action", ["list"])[0]
             root = resolve_git_root(raw_path)
             branches = git_branches_for(root)
             active_branch = git_branch_for(root)
@@ -387,21 +442,25 @@ class Handler(BaseHTTPRequestHandler):
             requested_branch = query.get("branch", [None])[0]
             target_ref = None
             if requested_branch and is_safe_git_ref(requested_branch):
-                verify = subprocess.run(
-                    ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{requested_branch}^{{commit}}"],
-                    check=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5,
-                )
-                if verify.returncode == 0:
-                    target_ref = requested_branch
+                clean_ref = requested_branch.removeprefix("refs/heads/")
+                if clean_ref == "HEAD":
+                    target_ref = "HEAD"
+                else:
+                    verify = subprocess.run(
+                        ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"refs/heads/{clean_ref}^{{commit}}"],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        timeout=5,
+                    )
+                    if verify.returncode == 0:
+                        target_ref = clean_ref
 
             if not target_ref:
                 target_ref = active_branch if active_branch and not active_branch.startswith("detached HEAD") else "HEAD"
 
             if active_branch and active_branch.startswith("detached HEAD"):
-                branches.insert(0, {"name": "HEAD", "label": active_branch, "group": "Current"})
+                branches.insert(0, {"name": "HEAD", "label": active_branch})
 
             output = git_output([
                 "git", "-C", str(root), "log", "-10",
@@ -412,6 +471,8 @@ class Handler(BaseHTTPRequestHandler):
             for line in output.splitlines():
                 full_hash, short_hash, date, subject = line.split("\x1f", 3)
                 commits.append({"hash": full_hash, "shortHash": short_hash, "date": date, "subject": subject})
+            event_name = "REFRESH_GIT" if action == "refresh" else "LIST_COMMITS"
+            self.log_action(event_name, f"root={root} branch={target_ref} commits={len(commits)}")
             self.send_json(HTTPStatus.OK, {
                 "root": str(root),
                 "branch": target_ref,
@@ -420,12 +481,14 @@ class Handler(BaseHTTPRequestHandler):
                 "commits": commits,
             })
         except PortalError as error:
-            self.send_error_json(error.status, error.message)
+            self.send_error_json(error.status, error.message, path=raw_path)
 
     def show_commit(self, request):
+        raw_path = None
         try:
             query = parse_qs(request.query)
-            root = resolve_git_root(query.get("path", [None])[0])
+            raw_path = query.get("path", [None])[0]
+            root = resolve_git_root(raw_path)
             commits = query.get("commits", [query.get("commit", [""])[0]])[0].split(",")
             if not 1 <= len(commits) <= 8 or any(
                 not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit) for commit in commits
@@ -438,14 +501,16 @@ class Handler(BaseHTTPRequestHandler):
             if patch == "1":
                 command.append("--patch")
             content = git_output([*command, *commits])
+            self.log_action("SHOW_COMMIT", f"root={root} commits={','.join(commits)} patch={patch == '1'}")
             self.send_json(HTTPStatus.OK, {
                 "path": str(root), "commits": commits, "patch": patch == "1", "content": content,
             })
         except PortalError as error:
-            self.send_error_json(error.status, error.message)
+            self.send_error_json(error.status, error.message, path=raw_path)
 
     def write_file(self, payload):
-        path = resolve_path(payload.get("path"))
+        raw_path = payload.get("path")
+        path = resolve_path(raw_path)
         content = payload.get("content")
         expected_mtime = payload.get("mtimeNs")
         if not isinstance(content, str):
@@ -469,7 +534,9 @@ class Handler(BaseHTTPRequestHandler):
             os.replace(temporary_path, path)
         except OSError as error:
             raise PortalError(HTTPStatus.INTERNAL_SERVER_ERROR, f"Unable to save file: {error}") from None
-        self.send_json(HTTPStatus.OK, metadata(path))
+        meta = metadata(path)
+        self.log_action("SAVE_FILE", f"path={path} size={meta['size']}")
+        self.send_json(HTTPStatus.OK, meta)
 
     def send_json(self, status, payload):
         data = json.dumps(payload, ensure_ascii=True).encode("utf-8")
@@ -481,7 +548,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_error_json(self, status, message):
+    def send_error_json(self, status, message, path=None):
+        details = f"status={int(status)} message={message!r}"
+        if path:
+            details += f" path={path}"
+        self.log_action("ERROR", details)
         self.send_json(status, {"error": message})
 
     def send_html(self):
@@ -519,26 +590,26 @@ INDEX_HTML = r'''<!doctype html>
 :root{color-scheme:dark;--bg:#172029;--panel:#202c35;--line:#40515a;--text:#eff4f1;--muted:#aab9b6;--teal:#49c5a9;--gold:#f4ba5b;--danger:#f48670}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,sans-serif}.app{height:100vh;display:grid;grid-template-rows:auto 1fr}header{padding:12px 18px;border-bottom:1px solid var(--line);display:flex;flex-wrap:nowrap;gap:10px;align-items:center;background:#1c2730}h1{font-size:16px;margin:0 8px 0 0;font-weight:650}.folder-mark{position:relative;width:21px;height:16px;border-radius:2px;background:var(--teal);margin-left:1px}.folder-mark:before{content:"";position:absolute;width:10px;height:4px;top:-3px;left:1px;border-radius:2px 2px 0 0;background:var(--gold)}.clock{min-width:122px;color:var(--muted);font:14px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap}.path{flex:1;min-width:0;background:#101820;border:1px solid var(--line);color:var(--text);padding:8px 10px;border-radius:4px}button,.commit-count{border:1px solid var(--line);border-radius:4px;background:#2a3942;color:var(--text);padding:8px 11px;cursor:pointer}button:hover,.commit-count:hover{border-color:var(--teal)}button:disabled{opacity:.5;cursor:not-allowed}.save{background:#167b68;border-color:#219d86}.copy{position:relative;width:31px;height:31px;padding:0}.copy:before,.copy:after{content:"";position:absolute;width:10px;height:12px;border:1px solid currentColor;border-radius:1px}.copy:before{left:10px;top:8px}.copy:after{left:7px;top:5px;background:#2a3942}.commit-count{height:31px;padding:0 7px;font:12px system-ui,sans-serif}.layout{min-height:0;display:grid;grid-template-columns:minmax(250px,var(--sidebar-width,30%)) 6px minmax(360px,1fr)}.browser{overflow:auto;background:#1c2730}.splitter{position:relative;cursor:col-resize;background:var(--line);touch-action:none}.splitter:after{content:"";position:absolute;inset:0 -3px}.splitter:hover,.splitter:focus{background:var(--teal);outline:0}body.resizing,body.resizing *{cursor:col-resize!important;user-select:none!important}.crumb{padding:12px 14px;border-bottom:1px solid var(--line);color:var(--muted);word-break:break-all}.entry{display:flex;align-items:center;gap:9px;width:100%;border:0;border-radius:0;background:transparent;text-align:left;padding:8px 14px;color:var(--text)}.entry:hover{background:#2a3942}.entry.active{background:#2a3942;box-shadow:inset 3px 0 0 var(--teal)}#entries .entry.active .git-entry-meta{background:#2a3942}.entry-info{display:flex;align-items:center;gap:10px;min-width:0;flex:1}.entry-info strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}.entry-meta{display:flex;gap:8px;flex:0 0 auto;color:var(--muted);font:12px ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap}.icon{position:relative;display:block;flex:0 0 18px;width:18px;height:19px}.icon.folder{height:14px;margin-top:3px;border-radius:2px;background:#d9a858}.icon.folder:before{content:"";position:absolute;top:-3px;left:1px;width:9px;height:4px;border-radius:2px 2px 0 0;background:#f2c56e}.icon.file{width:14px;height:18px;margin-left:2px;border:1px solid currentColor;border-radius:2px;color:#aab9b6;background:#24313a}.icon.file:before{content:"";position:absolute;top:-1px;right:-1px;border-top:6px solid #1c2730;border-left:6px solid transparent}.icon.file.code{color:#5bb4e6}.icon.file.config{color:#d6c15e}.icon.file.markdown{color:#67cba3}.icon.file.image{color:#d88cbe}.icon.file.archive{color:#e99662}.icon.git{width:15px;height:15px;margin:2px 0 0 2px;border-left:2px solid #ed8b5f;border-bottom:2px solid #ed8b5f;transform:rotate(-45deg)}.icon.git:before,.icon.git:after{content:"";position:absolute;width:5px;height:5px;border-radius:50%;background:#ed8b5f}.icon.git:before{left:-4px;bottom:-4px}.icon.git:after{right:-4px;top:-4px}.editor{min-width:0;display:grid;grid-template-rows:auto 1fr}.filebar{padding:10px 14px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;color:var(--muted)}.filebar span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.status{margin-left:auto;color:var(--muted);white-space:nowrap}.status.error{color:var(--danger)}.status.ok{color:var(--teal)}.content-shell{min-height:0;display:grid;grid-template-columns:auto minmax(0,1fr);background:#101820}.line-numbers{margin:0;padding:16px 8px;min-width:52px;overflow:hidden;border-right:1px solid #2a3942;background:#172029;color:#718582;text-align:right;user-select:none;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:4}textarea{width:100%;height:100%;resize:none;border:0;outline:0;padding:16px;background:#101820;color:#e7efe9;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;tab-size:4}.branch-select{max-width:220px;text-overflow:ellipsis}@media(max-width:760px){.layout{grid-template-columns:1fr;grid-template-rows:36% 64%}.splitter{display:none}.browser{border-bottom:1px solid var(--line)}header{flex-wrap:wrap}.path{order:2;flex-basis:100%}.entry-meta{gap:5px;font-size:11px}}
 </style></head><body><main class="app"><header><span class="folder-mark" aria-hidden="true"></span><h1>Workspace Files</h1><select id="presets" class="path" aria-label="Saved paths"></select><input id="path" class="path" spellcheck="false" aria-label="Absolute path"><button id="open">Open</button><button id="up">Up</button><button id="refresh-head" type="button" title="Refresh">Refresh</button><button id="save" class="save" disabled>Save</button><time id="clock" class="clock" title="Current browser time"></time></header><section id="layout" class="layout"><aside class="browser"><div id="directory" class="crumb"></div><div id="entries"></div></aside><div id="splitter" class="splitter" role="separator" aria-orientation="vertical" aria-label="Resize file list and preview"></div><section class="editor"><div class="filebar"><button id="refresh" type="button" title="Refresh directory/commits and content">Refresh</button><button id="copy" class="copy" type="button" aria-label="Copy file contents" title="Copy file contents" disabled></button><button id="download" type="button" title="Download selected patch, Markdown file, or directory" disabled>Download</button><select id="git-branch" class="commit-count branch-select" aria-label="Git branch" title="Switch git branch" hidden></select><select id="commit-count" class="commit-count" aria-label="Number of commits to show" title="Number of commits to show" hidden><option value="1">1 commit</option><option value="2">2 commits</option><option value="3">3 commits</option><option value="4">4 commits</option><option value="5">5 commits</option><option value="6">6 commits</option><option value="7">7 commits</option><option value="8">8 commits</option></select><select id="commit-view" class="commit-count" aria-label="Commit display mode" title="Commit display mode" hidden><option value="1">Log + patch</option><option value="0">Log only</option></select><span id="file">Choose a text file</span><span id="status" class="status"></span></div><div class="content-shell"><pre id="line-numbers" class="line-numbers" aria-hidden="true">1</pre><div class="code-layer"><pre id="highlight" class="highlight" aria-hidden="true"></pre><textarea id="content" spellcheck="false" wrap="off" placeholder="Select a UTF-8 text file to view or edit." disabled></textarea></div></div></section></section></main>
 <script>
-const base='/shell_file',layout=document.querySelector('#layout'),splitter=document.querySelector('#splitter'),pathInput=document.querySelector('#path'),presets=document.querySelector('#presets'),entries=document.querySelector('#entries'),directory=document.querySelector('#directory'),content=document.querySelector('#content'),lineNumbers=document.querySelector('#line-numbers'),file=document.querySelector('#file'),status=document.querySelector('#status'),save=document.querySelector('#save'),copy=document.querySelector('#copy'),downloadButton=document.querySelector('#download'),gitBranch=document.querySelector('#git-branch'),refreshButton=document.querySelector('#refresh'),refreshHead=document.querySelector('#refresh-head'),clock=document.querySelector('#clock'),commitCount=document.querySelector('#commit-count'),commitView=document.querySelector('#commit-view'),lastDirectoryKey='workspaceFilePortal.lastDirectory',lastGitRootKey='workspaceFilePortal.lastGitRoot',lastViewModeKey='workspaceFilePortal.lastViewMode',lastFileKey='workspaceFilePortal.lastFile',commitCountKey='workspaceFilePortal.commitCount',commitViewKey='workspaceFilePortal.commitView',sidebarWidthKey='workspaceFilePortal.sidebarWidth';function lastFileKeyFor(dir){return 'workspaceFilePortal.lastFile:'+(dir||'')}function gitBranchKey(root){return 'workspaceFilePortal.gitBranch:'+(root||'')}let current=null,currentDirectory=null,viewMode='files',gitRoot=null,gitCommits=[],gitStartIndex=0;
+const base='/shell_file',layout=document.querySelector('#layout'),splitter=document.querySelector('#splitter'),pathInput=document.querySelector('#path'),presets=document.querySelector('#presets'),entries=document.querySelector('#entries'),directory=document.querySelector('#directory'),content=document.querySelector('#content'),lineNumbers=document.querySelector('#line-numbers'),file=document.querySelector('#file'),status=document.querySelector('#status'),save=document.querySelector('#save'),copy=document.querySelector('#copy'),downloadButton=document.querySelector('#download'),gitBranch=document.querySelector('#git-branch'),refreshButton=document.querySelector('#refresh'),refreshHead=document.querySelector('#refresh-head'),clock=document.querySelector('#clock'),commitCount=document.querySelector('#commit-count'),commitView=document.querySelector('#commit-view'),lastDirectoryKey='workspaceFilePortal.lastDirectory',lastGitRootKey='workspaceFilePortal.lastGitRoot',lastViewModeKey='workspaceFilePortal.lastViewMode',lastFileKey='workspaceFilePortal.lastFile',commitCountKey='workspaceFilePortal.commitCount',commitViewKey='workspaceFilePortal.commitView',sidebarWidthKey='workspaceFilePortal.sidebarWidth';function lastFileKeyFor(dir){return 'workspaceFilePortal.lastFile:'+(dir||'')}function gitBranchKey(root){return 'workspaceFilePortal.gitBranch:'+(root||'')}function presetForPath(path){if(!path)return'';const matches=Array.from(presets.options).map(option=>option.value).filter(value=>value.startsWith('/')&&(path===value||path.startsWith(value+'/'))).sort((left,right)=>right.length-left.length);return matches[0]||''}function lastDirKeyForPreset(preset){return 'workspaceFilePortal.lastDir:'+(preset||'')}function lastFileKeyForPreset(preset){return 'workspaceFilePortal.lastFile:'+(preset||'')}function syncPresetForPath(path){presets.value=presetForPath(path)}let current=null,currentDirectory=null,currentParent=null,viewMode='files',gitRoot=null,gitCommits=[],gitStartIndex=0;
+function logPortal(level,tag,...args){const time=new Date().toLocaleTimeString('en-GB',{hour12:false}),prefix='[Portal '+time+'] ['+tag+']';if(level==='error')console.error(prefix,...args);else if(level==='warn')console.warn(prefix,...args);else console.log(prefix,...args)}
 function setStatus(message='',kind=''){status.textContent=message;status.className='status '+kind}async function request(url,options){const response=await fetch(url,options);const data=await response.json();if(!response.ok)throw new Error(data.error||'Request failed');return data}function fmt(size){return size<1024?size+' B':(size/1024).toFixed(1)+' KiB'}function dateTime(date){return String(date.getMonth()+1).padStart(2,'0')+'-'+String(date.getDate()).padStart(2,'0')+' '+date.toLocaleTimeString('en-GB',{hour12:false})}function formatTime(value){return dateTime(new Date(Number(value)/1000000))}function updateClock(){const now=new Date();clock.textContent=dateTime(now);clock.title=now.toLocaleString('sv-SE',{hour12:false})}function updateLineNumbers(){lineNumbers.textContent=Array.from({length:content.value.split('\n').length},(_,index)=>index+1).join('\n');lineNumbers.scrollTop=content.scrollTop}function setSidebarWidth(width,persist=false){if(window.innerWidth<=760)return;const bounds=layout.getBoundingClientRect(),minimum=250,maximum=Math.max(minimum,bounds.width-366),next=Math.round(Math.max(minimum,Math.min(width,maximum)));layout.style.setProperty('--sidebar-width',next+'px');if(persist)localStorage.setItem(sidebarWidthKey,String(next))}splitter.onpointerdown=event=>{if(window.innerWidth<=760)return;splitter.setPointerCapture(event.pointerId);document.body.classList.add('resizing');setSidebarWidth(event.clientX-layout.getBoundingClientRect().left)};splitter.onpointermove=event=>{if(splitter.hasPointerCapture(event.pointerId))setSidebarWidth(event.clientX-layout.getBoundingClientRect().left)};function stopResizing(event){if(splitter.hasPointerCapture(event.pointerId))splitter.releasePointerCapture(event.pointerId);document.body.classList.remove('resizing');const value=parseInt(layout.style.getPropertyValue('--sidebar-width'),10);if(value)setSidebarWidth(value,true)}splitter.onpointerup=stopResizing;splitter.onpointercancel=stopResizing;window.addEventListener('resize',()=>{const value=parseInt(layout.style.getPropertyValue('--sidebar-width'),10);if(value)setSidebarWidth(value,true)})
 function escapeHtml(value){return value.replace(/[&<>]/g,character=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[character]))}function token(className,value){return '<span class="'+className+'">'+escapeHtml(value)+'</span>'}function highlightDiff(value){return value.split('\n').map(line=>{if(/^commit\b/.test(line))return token('tok-git-head',line);if(/^(Author|Commit|Date):/.test(line))return token('tok-log',line);if(/^diff --git|^index\b/.test(line))return token('tok-diff-meta',line);if(/^@@/.test(line))return token('tok-diff-hunk',line);if(/^(\+\+\+|---)/.test(line))return token('tok-diff-meta',line);if(/^\+/.test(line))return token('tok-diff-add',line);if(/^-/.test(line))return token('tok-diff-remove',line);return escapeHtml(line)}).join('\n')}function highlightC(value){const pattern=/\/\/.*|\/\*.*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|^\s*#\s*\w+|\b(?:auto|break|case|char|const|continue|default|do|double|else|enum|extern|float|for|goto|if|inline|int|long|register|return|short|signed|sizeof|static|struct|switch|typedef|union|unsigned|void|volatile|while)\b|\b(?:0x[\da-fA-F]+|\d+(?:\.\d+)?)\b/g;return value.split('\n').map(line=>{let output='',position=0;for(const match of line.matchAll(pattern)){const text=match[0];output+=escapeHtml(line.slice(position,match.index));const className=/^\/[/\*]/.test(text)?'tok-comment':/^["']/.test(text)?'tok-string':/^\s*#/.test(text)?'tok-preprocessor':/^\d|^0x/i.test(text)?'tok-number':'tok-keyword';output+=token(className,text);position=match.index+text.length}return output+escapeHtml(line.slice(position))}).join('\n')}function highlightText(value){const pattern=/https?:\/\/[^\s]+|\b(?:ERROR|WARN|WARNING|FATAL|INFO|DEBUG)\b|\b\d+(?:\.\d+)?\b/g;return value.split('\n').map(line=>{if(/^\s*#/.test(line))return token('tok-text-head',line);let output='',position=0;for(const match of line.matchAll(pattern)){const text=match[0];output+=escapeHtml(line.slice(position,match.index));output+=token(/^https?:/.test(text)?'tok-url':/^[A-Z]+$/.test(text)?'tok-alert':'tok-number',text);position=match.index+text.length}return output+escapeHtml(line.slice(position))}).join('\n')}function updateHighlight(){const highlight=document.querySelector('#highlight'),path=current?.path||'';highlight.innerHTML=viewMode==='git'||/\.(patch|diff)$/i.test(path)?highlightDiff(content.value):/\.(c|cc|cpp|h|hpp)$/i.test(path)?highlightC(content.value):highlightText(content.value);highlight.scrollTop=content.scrollTop;highlight.scrollLeft=content.scrollLeft}function syncContentScroll(){lineNumbers.scrollTop=content.scrollTop;const highlight=document.querySelector('#highlight');highlight.scrollTop=content.scrollTop;highlight.scrollLeft=content.scrollLeft}function updateLineNumbers(){lineNumbers.textContent=Array.from({length:content.value.split('\n').length},(_,index)=>index+1).join('\n');updateHighlight();syncContentScroll()}content.addEventListener('scroll',syncContentScroll)
-function syncPresetForPath(path){const matches=Array.from(presets.options).map(option=>option.value).filter(value=>value.startsWith('/')&&(path===value||path.startsWith(value+'/'))).sort((left,right)=>right.length-left.length);presets.value=matches[0]||''}
 function fileIconType(name){const extension=name.includes('.')?name.split('.').pop().toLowerCase():'';if(['c','cc','cpp','h','hpp','py','js','ts','java','go','rs','sh','bash','zsh'].includes(extension))return'code';if(['json','yaml','yml','toml','ini','conf','xml'].includes(extension))return'config';if(['md','rst','txt','log'].includes(extension))return'markdown';if(['png','jpg','jpeg','gif','webp','svg'].includes(extension))return'image';if(['zip','gz','xz','bz2','tar','7z'].includes(extension))return'archive';return''}
 function isDownloadablePath(path){return /\.(patch|md|txt)$/i.test(path)}
 function gitDirectoryLabel(path,branch){return branch?path+'  |  branch: '+branch:path}
 function highlightActiveFile(path){entries.querySelectorAll('.entry').forEach(btn=>{if(btn.dataset.path===path)btn.classList.add('active');else btn.classList.remove('active')})}
 function highlightActiveCommitRange(start,count){entries.querySelectorAll('.entry').forEach((btn,idx)=>{if(idx>=start&&idx<start+count)btn.classList.add('active');else btn.classList.remove('active')})}
 function setDownloadTarget(path,kind=''){downloadButton.disabled=!path||!kind;downloadButton.dataset.path=path||'';downloadButton.dataset.kind=kind;downloadButton.textContent=kind==='directory'?'Download folder':'Download file';downloadButton.title=kind==='directory'?'Download all .patch, .md, and .txt files in this directory':'Download this .patch, .md, or .txt file'}
-async function downloadSelected(){const target=downloadButton.dataset.path;if(!target)return;downloadButton.disabled=true;try{const response=await fetch(base+'/api/download?path='+encodeURIComponent(target));if(!response.ok){let data={};try{data=await response.json()}catch(error){}throw new Error(data.error||'Download failed')}const blob=await response.blob(),objectUrl=URL.createObjectURL(blob),anchor=document.createElement('a'),name=target.slice(target.lastIndexOf('/')+1)||'download';anchor.href=objectUrl;anchor.download=downloadButton.dataset.kind==='directory'?name+'.zip':name;document.body.append(anchor);anchor.click();anchor.remove();setTimeout(()=>URL.revokeObjectURL(objectUrl),1000);setStatus('Download started','ok')}catch(error){setStatus(error.message,'error')}finally{downloadButton.disabled=false}}
-async function browse(target){try{viewMode='files';localStorage.setItem(lastViewModeKey,viewMode);gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;const data=await request(base+'/api/list?path='+encodeURIComponent(target));currentDirectory=data.path;directory.textContent=gitDirectoryLabel(data.path,data.gitBranch);syncPresetForPath(data.path);localStorage.setItem(lastDirectoryKey,data.path);if(data.gitRoot)localStorage.setItem(lastGitRootKey,data.gitRoot);if(current&&current.path.slice(0,current.path.lastIndexOf('/'))!==data.path){current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true}entries.replaceChildren();if(data.parent){const button=document.createElement('button'),icon=document.createElement('span'),name=document.createElement('strong');button.className='entry';icon.className='icon folder';icon.setAttribute('aria-hidden','true');name.textContent='..';button.append(icon,name);button.onclick=()=>browse(data.parent);entries.append(button)}for(const entry of data.entries){const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('span'),size=document.createElement('span'),time=document.createElement('span');button.className='entry';button.dataset.path=entry.path;if(current&&current.path===entry.path)button.classList.add('active');icon.className=entry.directory?'icon folder':'icon file '+fileIconType(entry.name);icon.setAttribute('aria-hidden','true');info.className='entry-info';meta.className='entry-meta';name.textContent=entry.name;size.textContent=entry.directory?'Folder':fmt(entry.size);time.textContent=formatTime(entry.mtimeNs);time.title=new Date(Number(entry.mtimeNs)/1000000).toLocaleString('sv-SE',{hour12:false});meta.append(size,time);info.append(name,meta);button.append(icon,info);button.onclick=()=>entry.directory?browse(entry.path):openPath(entry.path);entries.append(button)}if(!current){pathInput.value=data.path;setDownloadTarget(data.path,'directory')}setStatus()}catch(error){setStatus(error.message,'error')}}
-async function openFile(target){const data=await request(base+'/api/file?path='+encodeURIComponent(target));gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;syncPresetForPath(data.path);current=data;pathInput.value=data.path;file.textContent=data.path+'  '+fmt(data.size);content.value=data.content;updateLineNumbers();content.disabled=!data.writable;content.readOnly=!data.writable;save.disabled=!data.writable;copy.disabled=false;setDownloadTarget(isDownloadablePath(data.path)?data.path:'','file');setStatus(data.writable?'':'Read-only','ok');localStorage.setItem(lastFileKey,data.path);const parentDir=data.path.slice(0,data.path.lastIndexOf('/'))||'/';localStorage.setItem(lastFileKeyFor(parentDir),data.path);if(currentDirectory)localStorage.setItem(lastFileKeyFor(currentDirectory),data.path);highlightActiveFile(data.path)}
-async function openPath(target){try{await openFile(target);const parentDir=target.slice(0,target.lastIndexOf('/'))||'/';if(currentDirectory!==parentDir){await browse(parentDir);highlightActiveFile(target)}}catch(error){if(error.message==='Path is not a regular file.')await browse(target);else if(error.message==='File exceeds the 2 MiB editing limit.'&&isDownloadablePath(target)){current=null;pathInput.value=target;file.textContent=target+'  (download only)';content.value='';updateLineNumbers();content.disabled=true;content.readOnly=true;save.disabled=true;copy.disabled=true;setDownloadTarget(target,'file');setStatus('File is larger than 2 MiB; download only','ok')}else setStatus(error.message,'error')}}
-async function showGit(target,branch){viewMode='git';localStorage.setItem(lastViewModeKey,viewMode);presets.value='__git__';try{const rootTarget=target||localStorage.getItem(lastGitRootKey)||currentDirectory||'';const rememberedBranch=branch||(rootTarget?localStorage.getItem(gitBranchKey(rootTarget)):null);let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget);if(rememberedBranch)url+='&branch='+encodeURIComponent(rememberedBranch);const data=await request(url);gitRoot=data.root;gitCommits=data.commits;gitStartIndex=0;currentDirectory=data.root;localStorage.setItem(lastGitRootKey,data.root);if(data.branch)localStorage.setItem(gitBranchKey(data.root),data.branch);directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);pathInput.value=data.root;gitBranch.replaceChildren();const groups={};(data.branches||[]).forEach(item=>{const groupName=item.group||'Other';if(!groups[groupName]){const optgroup=document.createElement('optgroup');optgroup.label=groupName;groups[groupName]=optgroup;gitBranch.append(optgroup)}const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;groups[groupName].append(option)});if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';gitBranch.hidden=false;commitCount.hidden=false;commitView.hidden=false;current=null;content.value='';updateLineNumbers();content.disabled=true;content.readOnly=false;save.disabled=true;copy.disabled=true;setDownloadTarget('');file.textContent='Select a commit to view its patch';entries.replaceChildren();data.commits.forEach((commit,index)=>{const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';name.textContent=commit.subject;meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)});if(data.commits.length)await openCommitRange(0);else setStatus('No commits found on branch '+(data.branch||''),'ok')}catch(error){setStatus(error.message+' Browse a Git repository first.','error')}}
-async function openCommitRange(startIndex){try{if(!gitRoot||!gitCommits.length)return;gitStartIndex=startIndex;const count=Number(commitCount.value)||1;const selected=gitCommits.slice(startIndex,startIndex+count);const params=new URLSearchParams({path:gitRoot,commits:selected.map(commit=>commit.hash).join(','),patch:commitView.value});const data=await request(base+'/api/git/show?'+params);current=null;content.value=data.content;updateLineNumbers();content.disabled=false;content.readOnly=true;file.textContent=data.path+' @ '+selected.length+' commit'+(selected.length===1?'':'s')+(data.patch?' + patch':' log');save.disabled=true;copy.disabled=false;setDownloadTarget('');setStatus('Read-only commit view','ok');highlightActiveCommitRange(startIndex,count)}catch(error){setStatus(error.message,'error')}}
-async function refreshCurrent(){try{if(viewMode==='git'){if(!gitRoot)return;const rootTarget=gitRoot,currentBranch=gitBranch.value||localStorage.getItem(gitBranchKey(rootTarget));let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget);if(currentBranch)url+='&branch='+encodeURIComponent(currentBranch);const data=await request(url);gitCommits=data.commits;directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);gitBranch.replaceChildren();const groups={};(data.branches||[]).forEach(item=>{const groupName=item.group||'Other';if(!groups[groupName]){const optgroup=document.createElement('optgroup');optgroup.label=groupName;groups[groupName]=optgroup;gitBranch.append(optgroup)}const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;groups[groupName].append(option)});if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';entries.replaceChildren();data.commits.forEach((commit,index)=>{const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';name.textContent=commit.subject;meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)});if(data.commits.length){if(gitStartIndex>=data.commits.length)gitStartIndex=0;await openCommitRange(gitStartIndex);setStatus('Refreshed commits','ok')}else{current=null;content.value='';updateLineNumbers();file.textContent='No commits found';setStatus('No commits found on branch '+(data.branch||''),'ok')}}else{const dir=currentDirectory||(current?current.path.slice(0,current.path.lastIndexOf('/')):null)||pathInput.value;if(!dir)return;const activeFilePath=current?current.path:(localStorage.getItem(lastFileKeyFor(dir))||null);await browse(dir);if(activeFilePath){try{await openFile(activeFilePath);setStatus('Refreshed','ok')}catch(error){localStorage.removeItem(lastFileKeyFor(dir));localStorage.removeItem(lastFileKey);current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true;setDownloadTarget(dir,'directory');setStatus('File no longer accessible: '+error.message,'error')}}else{setStatus('Refreshed','ok')}}}catch(error){setStatus(error.message,'error')}}
+async function downloadSelected(){const target=downloadButton.dataset.path;if(!target)return;downloadButton.disabled=true;logPortal('info','DOWNLOAD_START',target,downloadButton.dataset.kind);try{const response=await fetch(base+'/api/download?path='+encodeURIComponent(target));if(!response.ok){let data={};try{data=await response.json()}catch(error){}throw new Error(data.error||'Download failed')}const blob=await response.blob(),objectUrl=URL.createObjectURL(blob),anchor=document.createElement('a'),name=target.slice(target.lastIndexOf('/')+1)||'download';anchor.href=objectUrl;anchor.download=downloadButton.dataset.kind==='directory'?name+'.zip':name;document.body.append(anchor);anchor.click();anchor.remove();setTimeout(()=>URL.revokeObjectURL(objectUrl),1000);setStatus('Download started','ok');logPortal('info','DOWNLOAD_SUCCESS',target)}catch(error){logPortal('error','DOWNLOAD_FAILED',target,error.message);setStatus(error.message,'error')}finally{downloadButton.disabled=false}}
+async function browse(target,action='browse'){try{logPortal('info',action==='refresh'?'REFRESH_DIR':'BROWSE',target);viewMode='files';localStorage.setItem(lastViewModeKey,viewMode);gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;const data=await request(base+'/api/list?path='+encodeURIComponent(target)+(action?'&action='+encodeURIComponent(action):''));currentDirectory=data.path;currentParent=data.parent;directory.textContent=gitDirectoryLabel(data.path,data.gitBranch);syncPresetForPath(data.path);localStorage.setItem(lastDirectoryKey,data.path);const preset=presetForPath(data.path);if(preset){localStorage.setItem(lastDirKeyForPreset(preset),data.path)}if(data.gitRoot)localStorage.setItem(lastGitRootKey,data.gitRoot);if(current&&current.path.slice(0,current.path.lastIndexOf('/'))!==data.path){current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true;localStorage.removeItem(lastFileKey);if(preset)localStorage.removeItem(lastFileKeyForPreset(preset))}entries.replaceChildren();if(data.parent){const button=document.createElement('button'),icon=document.createElement('span'),name=document.createElement('strong');button.className='entry';icon.className='icon folder';icon.setAttribute('aria-hidden','true');name.textContent='..';button.append(icon,name);button.onclick=()=>browse(data.parent);entries.append(button)}for(const entry of data.entries){const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('span'),size=document.createElement('span'),time=document.createElement('span');button.className='entry';button.dataset.path=entry.path;if(current&&current.path===entry.path)button.classList.add('active');icon.className=entry.directory?'icon folder':'icon file '+fileIconType(entry.name);icon.setAttribute('aria-hidden','true');info.className='entry-info';meta.className='entry-meta';name.textContent=entry.name;size.textContent=entry.directory?'Folder':fmt(entry.size);time.textContent=formatTime(entry.mtimeNs);time.title=new Date(Number(entry.mtimeNs)/1000000).toLocaleString('sv-SE',{hour12:false});meta.append(size,time);info.append(name,meta);button.append(icon,info);button.onclick=()=>entry.directory?browse(entry.path):openPath(entry.path);entries.append(button)}if(!current){pathInput.value=data.path;setDownloadTarget(data.path,'directory')}setStatus();logPortal('info','DIR_LOADED',data.path,data.entries.length+' items',data.gitRoot?'git='+data.gitRoot:'non-git')}catch(error){logPortal('error','BROWSE_FAILED',target,error.message);setStatus(error.message,'error')}}
+async function openFile(target,action='open'){logPortal('info',action==='refresh'?'REFRESH_FILE':(action==='restore'?'RESTORE_FILE':'OPEN_FILE'),target);const data=await request(base+'/api/file?path='+encodeURIComponent(target)+(action?'&action='+encodeURIComponent(action):''));gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;syncPresetForPath(data.path);current=data;pathInput.value=data.path;file.textContent=data.path+'  '+fmt(data.size);content.value=data.content;updateLineNumbers();content.disabled=!data.writable;content.readOnly=!data.writable;save.disabled=!data.writable;copy.disabled=false;setDownloadTarget(isDownloadablePath(data.path)?data.path:'','file');setStatus(data.writable?'':'Read-only','ok');const parentDir=data.path.slice(0,data.path.lastIndexOf('/'))||'/';localStorage.setItem(lastFileKey,data.path);localStorage.setItem(lastDirectoryKey,parentDir);localStorage.setItem(lastFileKeyFor(parentDir),data.path);const preset=presetForPath(data.path);if(preset){localStorage.setItem(lastDirKeyForPreset(preset),parentDir);localStorage.setItem(lastFileKeyForPreset(preset),data.path)}if(currentDirectory!==parentDir){await browse(parentDir)}highlightActiveFile(data.path);logPortal('info','FILE_LOADED',data.path,fmt(data.size),data.writable?'writable':'read-only')}
+async function openPath(target){try{await openFile(target)}catch(error){logPortal('warn','OPEN_PATH_FALLBACK',target,error.message);if(error.message==='Path is not a regular file.')await browse(target);else if(error.message==='File exceeds the 2 MiB editing limit.'&&isDownloadablePath(target)){current=null;pathInput.value=target;file.textContent=target+'  (download only)';content.value='';updateLineNumbers();content.disabled=true;content.readOnly=true;save.disabled=true;copy.disabled=true;setDownloadTarget(target,'file');setStatus('File is larger than 2 MiB; download only','ok');const parentDir=target.slice(0,target.lastIndexOf('/'))||'/';if(currentDirectory!==parentDir)await browse(parentDir);highlightActiveFile(target)}else{logPortal('error','OPEN_PATH_FAILED',target,error.message);setStatus(error.message,'error')}}}
+async function showGit(target,branch,action='git'){viewMode='git';localStorage.setItem(lastViewModeKey,viewMode);presets.value='__git__';try{const rootTarget=target||localStorage.getItem(lastGitRootKey)||currentDirectory||'';const rememberedBranch=branch||(rootTarget?localStorage.getItem(gitBranchKey(rootTarget)):null);logPortal('info',action==='refresh'?'REFRESH_GIT':'GIT_VIEW',rootTarget,rememberedBranch||'HEAD');let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget);if(rememberedBranch)url+='&branch='+encodeURIComponent(rememberedBranch);if(action)url+='&action='+encodeURIComponent(action);const data=await request(url);gitRoot=data.root;gitCommits=data.commits;gitStartIndex=0;currentDirectory=data.root;currentParent=null;localStorage.setItem(lastGitRootKey,data.root);if(data.branch)localStorage.setItem(gitBranchKey(data.root),data.branch);directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);pathInput.value=data.root;gitBranch.replaceChildren();(data.branches||[]).forEach(item=>{const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;gitBranch.append(option)});if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';gitBranch.hidden=false;commitCount.hidden=false;commitView.hidden=false;current=null;content.value='';updateLineNumbers();content.disabled=true;content.readOnly=false;save.disabled=true;copy.disabled=true;setDownloadTarget('');file.textContent='Select a commit to view its patch';entries.replaceChildren();data.commits.forEach((commit,index)=>{const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';name.textContent=commit.subject;meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)});logPortal('info','COMMITS_LOADED',data.root,data.branch,data.commits.length+' commits');if(data.commits.length)await openCommitRange(0);else setStatus('No commits found on branch '+(data.branch||''),'ok')}catch(error){logPortal('error','GIT_FAILED',error.message);setStatus(error.message+' Browse a Git repository first.','error')}}
+async function openCommitRange(startIndex){try{if(!gitRoot||!gitCommits.length)return;gitStartIndex=startIndex;const count=Number(commitCount.value)||1;const selected=gitCommits.slice(startIndex,startIndex+count);logPortal('info','SHOW_COMMIT',gitRoot,'hashes='+selected.map(c=>c.shortHash).join(','),'count='+count);const params=new URLSearchParams({path:gitRoot,commits:selected.map(commit=>commit.hash).join(','),patch:commitView.value});const data=await request(base+'/api/git/show?'+params);current=null;content.value=data.content;updateLineNumbers();content.disabled=false;content.readOnly=true;file.textContent=data.path+' @ '+selected.length+' commit'+(selected.length===1?'':'s')+(data.patch?' + patch':' log');save.disabled=true;copy.disabled=false;setDownloadTarget('');setStatus('Read-only commit view','ok');highlightActiveCommitRange(startIndex,count)}catch(error){logPortal('error','SHOW_COMMIT_FAILED',error.message);setStatus(error.message,'error')}}
+async function refreshCurrent(){logPortal('info','REFRESH_START','mode='+viewMode);try{if(viewMode==='git'){if(!gitRoot)return;const rootTarget=gitRoot,currentBranch=gitBranch.value||localStorage.getItem(gitBranchKey(rootTarget));let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget)+'&action=refresh';if(currentBranch)url+='&branch='+encodeURIComponent(currentBranch);const data=await request(url);logPortal('info','REFRESH_GIT_COMMITS',data.root,data.branch,data.commits.length+' commits');gitCommits=data.commits;directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);gitBranch.replaceChildren();(data.branches||[]).forEach(item=>{const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;gitBranch.append(option)});if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';entries.replaceChildren();data.commits.forEach((commit,index)=>{const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';name.textContent=commit.subject;meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)});if(data.commits.length){if(gitStartIndex>=data.commits.length)gitStartIndex=0;await openCommitRange(gitStartIndex);setStatus('Refreshed commits','ok')}else{current=null;content.value='';updateLineNumbers();file.textContent='No commits found';setStatus('No commits found on branch '+(data.branch||''),'ok')}}else{const dir=currentDirectory||(current?current.path.slice(0,current.path.lastIndexOf('/')):null)||pathInput.value;if(!dir)return;const activeFilePath=current?current.path:(localStorage.getItem(lastFileKeyFor(dir))||null);await browse(dir,'refresh');if(activeFilePath){try{await openFile(activeFilePath,'refresh');setStatus('Refreshed','ok')}catch(error){logPortal('warn','REFRESH_FILE_LOST',activeFilePath,error.message);localStorage.removeItem(lastFileKeyFor(dir));localStorage.removeItem(lastFileKey);const preset=presetForPath(dir);if(preset)localStorage.removeItem(lastFileKeyForPreset(preset));current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true;setDownloadTarget(dir,'directory');setStatus('File no longer accessible: '+error.message,'error')}}else{setStatus('Refreshed','ok')}}logPortal('info','REFRESH_COMPLETED','mode='+viewMode)}catch(error){logPortal('error','REFRESH_FAILED',error.message);setStatus(error.message,'error')}}
 function markDirty(){if(!current||content.readOnly)return;const entry=Array.from(entries.querySelectorAll('button[data-path]')).find(button=>button.dataset.path===current.path);if(entry){const meta=entry.querySelector('.entry-meta');if(meta)meta.textContent='Modified, not saved'}setStatus('Modified, not saved')}
 async function copyContents(){try{await navigator.clipboard.writeText(content.value);setStatus('Copied','ok')}catch(error){content.focus();content.select();if(document.execCommand('copy'))setStatus('Copied','ok');else setStatus('Copy failed','error')}}
-presets.onchange=async()=>{if(presets.value==='__git__'){await showGit(localStorage.getItem(lastGitRootKey)||pathInput.value||currentDirectory)}else if(presets.value){await browse(presets.value);const lastFile=localStorage.getItem(lastFileKeyFor(presets.value));if(lastFile){try{await openFile(lastFile)}catch(error){localStorage.removeItem(lastFileKeyFor(presets.value));current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true}}else{current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true}}else{viewMode='files';localStorage.setItem(lastViewModeKey,viewMode);gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;pathInput.value='';pathInput.focus()}};document.querySelector('#open').onclick=()=>viewMode==='git'?showGit(pathInput.value,gitBranch.value):openPath(pathInput.value);document.querySelector('#up').onclick=()=>viewMode==='git'?showGit(pathInput.value||localStorage.getItem(lastGitRootKey)):browse(currentDirectory||pathInput.value);if(refreshHead)refreshHead.onclick=refreshCurrent;refreshButton.onclick=refreshCurrent;pathInput.addEventListener('keydown',event=>{if(event.key==='Enter')viewMode==='git'?showGit(pathInput.value,gitBranch.value):openPath(pathInput.value)});content.addEventListener('input',()=>{updateLineNumbers();markDirty()});content.addEventListener('scroll',()=>{lineNumbers.scrollTop=content.scrollTop});copy.onclick=copyContents;downloadButton.onclick=downloadSelected;gitBranch.onchange=()=>{if(gitRoot){localStorage.setItem(gitBranchKey(gitRoot),gitBranch.value);showGit(gitRoot,gitBranch.value)}};commitCount.onchange=()=>{localStorage.setItem(commitCountKey,commitCount.value);if(viewMode==='git')openCommitRange(gitStartIndex)};commitView.onchange=()=>{localStorage.setItem(commitViewKey,commitView.value);if(viewMode==='git')openCommitRange(gitStartIndex)};save.onclick=async()=>{if(!current)return;save.disabled=true;try{const data=await request(base+'/api/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:current.path,content:content.value,mtimeNs:current.mtimeNs})});current={...current,...data,content:content.value};file.textContent=current.path+'  '+fmt(current.size);await browse(currentDirectory);highlightActiveFile(current.path);setStatus('Saved','ok')}catch(error){setStatus(error.message,'error')}finally{save.disabled=!current?.writable}};const savedCommitCount=localStorage.getItem(commitCountKey),savedCommitView=localStorage.getItem(commitViewKey),savedSidebarWidth=parseInt(localStorage.getItem(sidebarWidthKey),10);if(['1','2','3','4','5','6','7','8'].includes(savedCommitCount))commitCount.value=savedCommitCount;if(['0','1'].includes(savedCommitView))commitView.value=savedCommitView;if(savedSidebarWidth)setSidebarWidth(savedSidebarWidth);updateLineNumbers();updateClock();setInterval(updateClock,1000);request(base+'/api/roots').then(async data=>{data.presets.forEach(item=>{const option=document.createElement('option');option.value=item;option.textContent=item==='__git__'?'Git commits':item||'Custom path';presets.append(option)});const lastPath=localStorage.getItem(lastDirectoryKey)||data.roots[0];if(localStorage.getItem(lastViewModeKey)==='git'){await showGit(localStorage.getItem(lastGitRootKey)||lastPath)}else{await browse(lastPath);const lastFile=localStorage.getItem(lastFileKeyFor(lastPath))||localStorage.getItem(lastFileKey);if(lastFile&&(lastFile.startsWith(lastPath+'/')||lastFile.slice(0,lastFile.lastIndexOf('/'))===lastPath)){try{await openFile(lastFile)}catch(error){localStorage.removeItem(lastFileKeyFor(lastPath));localStorage.removeItem(lastFileKey)}}}}).catch(error=>setStatus(error.message,'error'));
+presets.onchange=async()=>{logPortal('info','PRESET_CHANGE',presets.value);if(presets.value==='__git__'){await showGit(localStorage.getItem(lastGitRootKey)||pathInput.value||currentDirectory)}else if(presets.value){const rememberedFile=localStorage.getItem(lastFileKeyForPreset(presets.value));const rememberedDir=localStorage.getItem(lastDirKeyForPreset(presets.value))||presets.value;if(rememberedFile){try{const parentDir=rememberedFile.slice(0,rememberedFile.lastIndexOf('/'))||'/';await browse(parentDir);await openFile(rememberedFile,'restore')}catch(error){logPortal('warn','RESTORE_PRESET_FILE_FAILED',rememberedFile,error.message);localStorage.removeItem(lastFileKeyForPreset(presets.value));await browse(rememberedDir)}}else{await browse(rememberedDir)}}else{viewMode='files';localStorage.setItem(lastViewModeKey,viewMode);gitBranch.hidden=true;commitCount.hidden=true;commitView.hidden=true;pathInput.value='';pathInput.focus()}};document.querySelector('#open').onclick=()=>viewMode==='git'?showGit(pathInput.value,gitBranch.value):openPath(pathInput.value);document.querySelector('#up').onclick=()=>viewMode==='git'?showGit(pathInput.value||localStorage.getItem(lastGitRootKey)):(currentParent?browse(currentParent):browse(currentDirectory||pathInput.value));if(refreshHead)refreshHead.onclick=refreshCurrent;refreshButton.onclick=refreshCurrent;pathInput.addEventListener('keydown',event=>{if(event.key==='Enter')viewMode==='git'?showGit(pathInput.value,gitBranch.value):openPath(pathInput.value)});content.addEventListener('input',()=>{updateLineNumbers();markDirty()});content.addEventListener('scroll',()=>{lineNumbers.scrollTop=content.scrollTop});copy.onclick=copyContents;downloadButton.onclick=downloadSelected;gitBranch.onchange=()=>{logPortal('info','BRANCH_CHANGE',gitBranch.value);if(gitRoot){localStorage.setItem(gitBranchKey(gitRoot),gitBranch.value);showGit(gitRoot,gitBranch.value)}};commitCount.onchange=()=>{localStorage.setItem(commitCountKey,commitCount.value);if(viewMode==='git')openCommitRange(gitStartIndex)};commitView.onchange=()=>{localStorage.setItem(commitViewKey,commitView.value);if(viewMode==='git')openCommitRange(gitStartIndex)};save.onclick=async()=>{if(!current)return;save.disabled=true;logPortal('info','SAVE_START',current.path,'bytes='+content.value.length);try{const data=await request(base+'/api/file',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:current.path,content:content.value,mtimeNs:current.mtimeNs})});current={...current,...data,content:content.value};file.textContent=current.path+'  '+fmt(current.size);await browse(currentDirectory);highlightActiveFile(current.path);setStatus('Saved','ok');logPortal('info','SAVE_SUCCESS',current.path,fmt(data.size))}catch(error){logPortal('error','SAVE_FAILED',current.path,error.message);setStatus(error.message,'error')}finally{save.disabled=!current?.writable}};const savedCommitCount=localStorage.getItem(commitCountKey),savedCommitView=localStorage.getItem(commitViewKey),savedSidebarWidth=parseInt(localStorage.getItem(sidebarWidthKey),10);if(['1','2','3','4','5','6','7','8'].includes(savedCommitCount))commitCount.value=savedCommitCount;if(['0','1'].includes(savedCommitView))commitView.value=savedCommitView;if(savedSidebarWidth)setSidebarWidth(savedSidebarWidth);updateLineNumbers();updateClock();setInterval(updateClock,1000);request(base+'/api/roots').then(async data=>{logPortal('info','APP_INIT','roots='+data.roots.join(','));data.presets.forEach(item=>{const option=document.createElement('option');option.value=item;option.textContent=item==='__git__'?'Git commits':item||'Custom path';presets.append(option)});if(localStorage.getItem(lastViewModeKey)==='git'){const lastGitPath=localStorage.getItem(lastGitRootKey)||localStorage.getItem(lastDirectoryKey)||data.roots[0];await showGit(lastGitPath)}else{const lastFile=localStorage.getItem(lastFileKey);const lastPath=localStorage.getItem(lastDirectoryKey)||data.roots[0];if(lastFile){const parentDir=lastFile.slice(0,lastFile.lastIndexOf('/'))||'/';await browse(parentDir);try{await openFile(lastFile,'restore')}catch(error){logPortal('warn','INIT_RESTORE_FAILED',lastFile,error.message);localStorage.removeItem(lastFileKey);const preset=presetForPath(parentDir);if(preset)localStorage.removeItem(lastFileKeyForPreset(preset))}}else{await browse(lastPath)}}}).catch(error=>{logPortal('error','APP_INIT_FAILED',error.message);setStatus(error.message,'error')});
 </script></body></html>'''
 
 
