@@ -199,7 +199,7 @@ def is_upstream_ref(ref_name):
         return False
     if "/" not in clean and clean not in ("master", "main"):
         return False
-    for prefix in ("origin/", "upstream/", "bpf-next/", "bpf/", "linux-next/"):
+    for prefix in ("origin/", "upstream/", "bpf-next/", "bpf/", "linux-next/", "tip/", "sched/"):
         if clean.startswith(prefix):
             return True
     if clean.endswith("/master") or clean.endswith("/main") or clean.endswith("/HEAD"):
@@ -227,6 +227,12 @@ def format_upstream_tree(ref_name):
         tree = "bpf-next tree"
     elif clean.startswith("bpf/") or clean == "bpf":
         tree = "bpf tree"
+    elif "tip" in clean and ("sched" in clean or "schedule" in clean):
+        tree = "tip/schedule tree"
+    elif clean.startswith("tip/") or clean == "tip":
+        tree = "tip/schedule tree"
+    elif clean.startswith("sched/") or clean in ("sched-core", "sched/core"):
+        tree = "tip/schedule tree"
     elif "linux-next" in clean:
         tree = "linux-next tree"
     elif "net-next" in clean:
@@ -251,7 +257,14 @@ def find_master_base(root, target_ref):
         return _MASTER_BASE_CACHE[cache_key]
 
     target_lower = clean_target.lower()
-    tree_hint = "bpf" if "bpf" in target_lower else ("net" if "net" in target_lower else None)
+    if "bpf" in target_lower:
+        tree_hint = "bpf"
+    elif "tip" in target_lower or "sched" in target_lower or "proxy" in target_lower:
+        tree_hint = "tip"
+    elif "net" in target_lower:
+        tree_hint = "net"
+    else:
+        tree_hint = None
 
     # If branch has no specific tree hint, or if tracking ref matches hint, try tracking ref
     try:
@@ -264,7 +277,14 @@ def find_master_base(root, target_ref):
         if res.returncode == 0 and res.stdout.strip():
             tracking_ref = res.stdout.strip()
             # Only test tracking ref if we do not have an incompatible tree hint
-            if not tree_hint or tree_hint in tracking_ref.lower():
+            if not tree_hint:
+                tracking_ok = True
+            elif tree_hint == "tip":
+                tracking_ok = "tip" in tracking_ref.lower() or "sched" in tracking_ref.lower()
+            else:
+                tracking_ok = tree_hint in tracking_ref.lower()
+
+            if tracking_ok:
                 cres = subprocess.run(
                     ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{tracking_ref}^{{commit}}"],
                     capture_output=True,
@@ -292,6 +312,9 @@ def find_master_base(root, target_ref):
     candidate_list = [
         "refs/remotes/origin/master",
         "refs/remotes/origin/main",
+        "refs/remotes/tip/sched/core",
+        "refs/remotes/tip/schedule",
+        "refs/remotes/tip/sched-core",
         "refs/remotes/bpf-next/master",
         "refs/remotes/bpf/master",
         "refs/remotes/upstream/master",
@@ -299,13 +322,32 @@ def find_master_base(root, target_ref):
         "refs/remotes/upstream/main",
         "refs/heads/main",
     ]
-    if "bpf" in target_lower:
+    if "bpf-next" in target_lower:
         priority = ["refs/remotes/bpf-next/master", "refs/remotes/bpf/master"]
         candidate_list = priority + [c for c in candidate_list if c not in priority]
-    elif "net" in target_lower:
+    elif "bpf" in target_lower:
+        priority = ["refs/remotes/bpf/master", "refs/remotes/bpf-next/master"]
+        candidate_list = priority + [c for c in candidate_list if c not in priority]
+    elif "tip" in target_lower or "sched" in target_lower or "proxy" in target_lower:
+        priority = [
+            "refs/remotes/tip/sched/core",
+            "refs/remotes/tip/schedule",
+            "refs/remotes/tip/sched-core",
+            "refs/remotes/tip/master",
+        ]
+        candidate_list = priority + [c for c in candidate_list if c not in priority]
+    elif "net-next" in target_lower:
         priority = ["refs/remotes/net-next/master", "refs/remotes/net/master"]
         candidate_list = priority + [c for c in candidate_list if c not in priority]
+    elif "net" in target_lower:
+        priority = ["refs/remotes/net/master", "refs/remotes/net-next/master"]
+        candidate_list = priority + [c for c in candidate_list if c not in priority]
 
+    known_targets = (
+        "master", "origin/master", "main", "origin/main",
+        "bpf-next/master", "bpf/master",
+        "tip/sched/core", "tip/schedule", "tip/sched-core", "tip/master",
+    )
     for ref in candidate_list:
         try:
             res = subprocess.run(
@@ -318,7 +360,7 @@ def find_master_base(root, target_ref):
                 continue
             ref_commit = res.stdout.strip()
             found_ref = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
-            if clean_target in ("master", "origin/master", "main", "origin/main", "bpf-next/master", "bpf/master") or target_ref == ref_commit:
+            if clean_target in known_targets or target_ref == ref_commit:
                 ret = (ref_commit, found_ref)
                 _MASTER_BASE_CACHE[cache_key] = ret
                 return ret
@@ -639,11 +681,34 @@ class Handler(BaseHTTPRequestHandler):
 
             master_base_hash = None
             master_label = None
+            target_lower = target_ref.lower()
+
+            def upstream_priority(ref):
+                r_lower = ref.lower()
+                if ("tip" in target_lower or "sched" in target_lower or "proxy" in target_lower) and "tip" in r_lower:
+                    return 0
+                if "bpf-next" in target_lower and "bpf-next" in r_lower:
+                    return 0
+                if "bpf" in target_lower and "bpf" in r_lower and "bpf-next" not in r_lower:
+                    return 0
+                if "bpf" in target_lower and "bpf" in r_lower:
+                    return 1
+                if "tip" in r_lower:
+                    return 2
+                if "bpf-next" in r_lower:
+                    return 3
+                if "bpf" in r_lower:
+                    return 4
+                if "linux-next" in r_lower:
+                    return 5
+                return 10
+
             for parts in raw_lines:
                 decorations = parts[4] if len(parts) > 4 else ""
                 ref_tokens = [r.strip() for r in decorations.split(",") if r.strip()]
                 matched_upstream = [r for r in ref_tokens if is_upstream_ref(r)]
                 if matched_upstream:
+                    matched_upstream.sort(key=upstream_priority)
                     master_base_hash = parts[0]
                     master_label = matched_upstream[0]
                     break
@@ -674,6 +739,7 @@ class Handler(BaseHTTPRequestHandler):
                     ref_tokens = [r.strip() for r in decorations.split(",") if r.strip()]
                     matched_upstream = [r for r in ref_tokens if is_upstream_ref(r)]
                     if matched_upstream:
+                        matched_upstream.sort(key=upstream_priority)
                         is_master = True
                         first_match = matched_upstream[0]
                         tree_name = format_upstream_tree(first_match)
