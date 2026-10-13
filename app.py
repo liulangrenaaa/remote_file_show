@@ -211,13 +211,17 @@ def resolve_git_root(value):
     return root
 
 
-def is_upstream_ref(ref_name):
+def is_upstream_ref(ref_name, current_branch=None):
     clean = ref_name.strip()
     if clean.startswith("tag: ") or clean.startswith("HEAD ->") or clean.startswith("HEAD"):
         return False
+    if current_branch:
+        clean_target = current_branch.removeprefix("refs/heads/").removeprefix("refs/remotes/").strip()
+        if clean == clean_target or clean.endswith(f"/{clean_target}"):
+            return False
     if "/" not in clean and clean not in ("master", "main"):
         return False
-    for prefix in ("origin/", "upstream/", "bpf-next/", "bpf/", "linux-next/", "tip/", "sched/"):
+    for prefix in ("origin/", "upstream/", "bpf-next/", "bpf/", "linux-next/", "tip/"):
         if clean.startswith(prefix):
             return True
     if clean.endswith("/master") or clean.endswith("/main") or clean.endswith("/HEAD"):
@@ -249,7 +253,7 @@ def format_upstream_tree(ref_name):
         tree = "tip/schedule tree"
     elif clean.startswith("tip/") or clean == "tip":
         tree = "tip/schedule tree"
-    elif clean.startswith("sched/") or clean in ("sched-core", "sched/core"):
+    elif clean in ("sched-core", "sched/core"):
         tree = "tip/schedule tree"
     elif "linux-next" in clean:
         tree = "linux-next tree"
@@ -268,23 +272,34 @@ def format_upstream_tree(ref_name):
 _MASTER_BASE_CACHE = {}
 
 
-def find_master_base(root, target_ref):
-    clean_target = target_ref.removeprefix("refs/heads/").removeprefix("refs/remotes/")
+def find_master_base(root, target_ref, active_branch=None):
+    ref_to_check = active_branch if target_ref == "HEAD" and active_branch else target_ref
+    clean_target = (ref_to_check or "").removeprefix("refs/heads/").removeprefix("refs/remotes/").strip()
+    if not clean_target or clean_target in ("master", "main", "origin/master", "origin/main", "upstream/master", "upstream/main"):
+        return None, None
+
     cache_key = (str(root), clean_target)
     if cache_key in _MASTER_BASE_CACHE:
         return _MASTER_BASE_CACHE[cache_key]
 
     target_lower = clean_target.lower()
-    if "bpf" in target_lower:
-        tree_hint = "bpf"
-    elif "tip" in target_lower or "sched" in target_lower or "proxy" in target_lower:
-        tree_hint = "tip"
-    elif "net" in target_lower:
-        tree_hint = "net"
-    else:
-        tree_hint = None
+    candidate_list = [
+        "refs/remotes/origin/master",
+        "refs/remotes/origin/main",
+        "refs/remotes/upstream/master",
+        "refs/remotes/upstream/main",
+        "refs/remotes/tip/sched/core",
+        "refs/remotes/tip/schedule",
+        "refs/remotes/tip/sched-core",
+        "refs/remotes/tip/master",
+        "refs/remotes/bpf-next/master",
+        "refs/remotes/bpf/master",
+        "refs/remotes/net-next/master",
+        "refs/remotes/net/master",
+        "refs/heads/master",
+        "refs/heads/main",
+    ]
 
-    # If branch has no specific tree hint, or if tracking ref matches hint, try tracking ref
     try:
         res = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "--symbolic-full-name", f"{target_ref}@{{u}}"],
@@ -294,78 +309,15 @@ def find_master_base(root, target_ref):
         )
         if res.returncode == 0 and res.stdout.strip():
             tracking_ref = res.stdout.strip()
-            # Only test tracking ref if we do not have an incompatible tree hint
-            if not tree_hint:
-                tracking_ok = True
-            elif tree_hint == "tip":
-                tracking_ok = "tip" in tracking_ref.lower() or "sched" in tracking_ref.lower()
-            else:
-                tracking_ok = tree_hint in tracking_ref.lower()
-
-            if tracking_ok:
-                cres = subprocess.run(
-                    ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{tracking_ref}^{{commit}}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=0.3,
-                )
-                if cres.returncode == 0 and cres.stdout.strip():
-                    tracking_commit = cres.stdout.strip()
-                    mb = subprocess.run(
-                        ["git", "-C", str(root), "merge-base", target_ref, tracking_commit],
-                        capture_output=True,
-                        text=True,
-                        timeout=0.3,
-                    )
-                    if mb.returncode == 0 and mb.stdout.strip():
-                        ret = (mb.stdout.strip(), tracking_ref)
-                    else:
-                        ret = (tracking_commit, tracking_ref)
-                    _MASTER_BASE_CACHE[cache_key] = ret
-                    return ret
+            if tracking_ref not in candidate_list:
+                candidate_list.insert(0, tracking_ref)
     except (OSError, subprocess.TimeoutExpired):
         pass
 
-    target_lower = clean_target.lower()
-    candidate_list = [
-        "refs/remotes/origin/master",
-        "refs/remotes/origin/main",
-        "refs/remotes/tip/sched/core",
-        "refs/remotes/tip/schedule",
-        "refs/remotes/tip/sched-core",
-        "refs/remotes/bpf-next/master",
-        "refs/remotes/bpf/master",
-        "refs/remotes/upstream/master",
-        "refs/heads/master",
-        "refs/remotes/upstream/main",
-        "refs/heads/main",
-    ]
-    if "bpf-next" in target_lower:
-        priority = ["refs/remotes/bpf-next/master", "refs/remotes/bpf/master"]
-        candidate_list = priority + [c for c in candidate_list if c not in priority]
-    elif "bpf" in target_lower:
-        priority = ["refs/remotes/bpf/master", "refs/remotes/bpf-next/master"]
-        candidate_list = priority + [c for c in candidate_list if c not in priority]
-    elif "tip" in target_lower or "sched" in target_lower or "proxy" in target_lower:
-        priority = [
-            "refs/remotes/tip/sched/core",
-            "refs/remotes/tip/schedule",
-            "refs/remotes/tip/sched-core",
-            "refs/remotes/tip/master",
-        ]
-        candidate_list = priority + [c for c in candidate_list if c not in priority]
-    elif "net-next" in target_lower:
-        priority = ["refs/remotes/net-next/master", "refs/remotes/net/master"]
-        candidate_list = priority + [c for c in candidate_list if c not in priority]
-    elif "net" in target_lower:
-        priority = ["refs/remotes/net/master", "refs/remotes/net-next/master"]
-        candidate_list = priority + [c for c in candidate_list if c not in priority]
+    best_candidate = None
+    min_dist = None
+    best_pref = -1
 
-    known_targets = (
-        "master", "origin/master", "main", "origin/main",
-        "bpf-next/master", "bpf/master",
-        "tip/sched/core", "tip/schedule", "tip/sched-core", "tip/master",
-    )
     for ref in candidate_list:
         try:
             res = subprocess.run(
@@ -377,27 +329,55 @@ def find_master_base(root, target_ref):
             if res.returncode != 0 or not res.stdout.strip():
                 continue
             ref_commit = res.stdout.strip()
-            found_ref = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
-            if clean_target in known_targets or target_ref == ref_commit:
-                ret = (ref_commit, found_ref)
-                _MASTER_BASE_CACHE[cache_key] = ret
-                return ret
             mb = subprocess.run(
                 ["git", "-C", str(root), "merge-base", target_ref, ref_commit],
                 capture_output=True,
                 text=True,
                 timeout=0.4,
             )
-            if mb.returncode == 0 and mb.stdout.strip():
-                base_commit = mb.stdout.strip()
+            if mb.returncode != 0 or not mb.stdout.strip():
+                continue
+            base_commit = mb.stdout.strip()
+
+            cnt = subprocess.run(
+                ["git", "-C", str(root), "rev-list", "--count", f"{base_commit}..{target_ref}"],
+                capture_output=True,
+                text=True,
+                timeout=0.4,
+            )
+            if cnt.returncode != 0 or not cnt.stdout.strip():
+                continue
+            dist = int(cnt.stdout.strip())
+
+            found_ref = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+
+            pref = 0
+            if "tip" in target_lower and "tip" in ref.lower():
+                pref = 10
+            elif "bpf" in target_lower and "bpf" in ref.lower():
+                pref = 10
+            elif "net" in target_lower and "net" in ref.lower():
+                pref = 10
+            elif "origin/master" in ref:
+                pref = 5
+            elif "master" in ref:
+                pref = 2
+
+            if min_dist is None or dist < min_dist or (dist == min_dist and pref > best_pref):
+                min_dist = dist
+                best_pref = pref
                 label = found_ref if base_commit == ref_commit else f"{found_ref} base"
-                ret = (base_commit, label)
-                _MASTER_BASE_CACHE[cache_key] = ret
-                return ret
-        except (OSError, subprocess.TimeoutExpired):
+                best_candidate = (base_commit, label, dist)
+        except (OSError, subprocess.TimeoutExpired, ValueError):
             continue
 
-    return None, None
+    if best_candidate and best_candidate[2] > 0:
+        ret = (best_candidate[0], best_candidate[1])
+    else:
+        ret = (None, None)
+
+    _MASTER_BASE_CACHE[cache_key] = ret
+    return ret
 
 
 def git_output(arguments):
@@ -702,46 +682,12 @@ class Handler(BaseHTTPRequestHandler):
             ])
             raw_lines = [line.split("\x1f", 4) for line in output.splitlines() if len(line.split("\x1f", 4)) >= 4]
 
-            master_base_hash = None
-            master_label = None
-            target_lower = target_ref.lower()
-
-            def upstream_priority(ref):
-                r_lower = ref.lower()
-                if ("tip" in target_lower or "sched" in target_lower or "proxy" in target_lower) and "tip" in r_lower:
-                    return 0
-                if "bpf-next" in target_lower and "bpf-next" in r_lower:
-                    return 0
-                if "bpf" in target_lower and "bpf" in r_lower and "bpf-next" not in r_lower:
-                    return 0
-                if "bpf" in target_lower and "bpf" in r_lower:
-                    return 1
-                if "tip" in r_lower:
-                    return 2
-                if "bpf-next" in r_lower:
-                    return 3
-                if "bpf" in r_lower:
-                    return 4
-                if "linux-next" in r_lower:
-                    return 5
-                return 10
-
-            for parts in raw_lines:
-                decorations = parts[4] if len(parts) > 4 else ""
-                ref_tokens = [r.strip() for r in decorations.split(",") if r.strip()]
-                matched_upstream = [r for r in ref_tokens if is_upstream_ref(r)]
-                if matched_upstream:
-                    matched_upstream.sort(key=upstream_priority)
-                    master_base_hash = parts[0]
-                    master_label = matched_upstream[0]
-                    break
-
-            if not master_base_hash:
-                master_base_hash, master_label = find_master_base(root, target_ref)
+            master_base_hash, master_label = find_master_base(root, target_ref, active_branch)
 
             commits = []
             found_first_master = False
-            for parts in raw_lines:
+            base_index = -1
+            for index, parts in enumerate(raw_lines):
                 full_hash = parts[0]
                 short_hash = parts[1]
                 date = parts[2]
@@ -751,24 +697,14 @@ class Handler(BaseHTTPRequestHandler):
                 is_master = False
                 badge = None
                 badge_detail = None
-                if master_base_hash and full_hash == master_base_hash and not found_first_master:
+                if master_base_hash and full_hash == master_base_hash and not found_first_master and index > 0:
                     is_master = True
+                    base_index = index
                     ref_name = master_label or "upstream"
                     tree_name = format_upstream_tree(ref_name)
                     badge = f"{tree_name} ({short_hash})"
                     badge_detail = f"{tree_name} [{ref_name}] ({short_hash}: {subject})"
                     found_first_master = True
-                elif not found_first_master:
-                    ref_tokens = [r.strip() for r in decorations.split(",") if r.strip()]
-                    matched_upstream = [r for r in ref_tokens if is_upstream_ref(r)]
-                    if matched_upstream:
-                        matched_upstream.sort(key=upstream_priority)
-                        is_master = True
-                        first_match = matched_upstream[0]
-                        tree_name = format_upstream_tree(first_match)
-                        badge = f"{tree_name} ({short_hash})"
-                        badge_detail = f"{tree_name} [{first_match}] ({short_hash}: {subject})"
-                        found_first_master = True
 
                 commit_item = {
                     "hash": full_hash,
@@ -781,8 +717,16 @@ class Handler(BaseHTTPRequestHandler):
                     commit_item["badge"] = badge
                     commit_item["badgeDetail"] = badge_detail or master_label or decorations or "upstream"
                 commits.append(commit_item)
+
             event_name = "REFRESH_GIT" if action == "refresh" else "LIST_COMMITS"
-            self.log_action(event_name, f"root={root} branch={target_ref} commits={len(commits)}")
+            branch_commits_count = base_index if base_index >= 0 else (0 if master_base_hash else len(commits))
+            log_detail = (
+                f"root={root} branch={target_ref} commits={len(commits)} "
+                f"base={master_base_hash[:12] if master_base_hash else 'none'} "
+                f"label='{master_label or 'none'}' base_idx={base_index} "
+                f"branch_commits={branch_commits_count}"
+            )
+            self.log_action(event_name, log_detail)
             self.send_json(HTTPStatus.OK, {
                 "root": str(root),
                 "branch": target_ref,
@@ -979,9 +923,9 @@ async function openFile(target,action='open'){logPortal('info',action==='refresh
 async function openPath(target){const clean=(target||'').trim();if(!clean)return;if(clean.endsWith('/')||clean==='.'||clean==='..')return browse(clean);try{await openFile(clean)}catch(error){logPortal('warn','OPEN_PATH_FALLBACK',clean,error.message);if(error.message==='Path is not a regular file.')await browse(clean);else if(error.message==='File exceeds the 2 MiB editing limit.'&&isDownloadablePath(clean)){current=null;pathInput.value=clean;file.textContent=clean+'  (download only)';content.value='';updateLineNumbers();content.disabled=true;content.readOnly=true;save.disabled=true;copy.disabled=true;setDownloadTarget(clean,'file');setStatus('File is larger than 2 MiB; download only','ok');const parentDir=clean.slice(0,clean.lastIndexOf('/'))||'/';if(currentDirectory!==parentDir)await browse(parentDir);highlightActiveFile(clean);updatePreviewState()}else{logPortal('error','OPEN_PATH_FAILED',clean,error.message);setStatus(error.message,'error')}}}
 let updateDividerToggle=()=>{};
 function syncCommitCountOptions(masterIndex){const prevValue=commitCount.value;commitCount.replaceChildren();if(masterIndex>0){const branchOpt=document.createElement('option');branchOpt.value='branch';branchOpt.textContent='Branch commits ('+masterIndex+')';commitCount.append(branchOpt)}for(let i=1;i<=20;i++){const opt=document.createElement('option');opt.value=String(i);opt.textContent=i===1?'1 commit':(i+' commits');commitCount.append(opt)}const saved=localStorage.getItem(commitCountKey);if(saved==='branch'&&masterIndex>0){commitCount.value='branch'}else if(saved&&Array.from(commitCount.options).some(o=>o.value===saved)){commitCount.value=saved}else if(prevValue&&Array.from(commitCount.options).some(o=>o.value===prevValue)){commitCount.value=prevValue}else if(masterIndex>0){commitCount.value='branch'}else{commitCount.value='1'}}
-function renderCommitList(data){entries.replaceChildren();let dividerInserted=false,masterIndex=-1;data.commits.forEach((commit,index)=>{if(commit.isMaster&&masterIndex===-1)masterIndex=index});gitMasterIndex=masterIndex;const upstreamCount=masterIndex>=0?data.commits.length-(masterIndex+1):0;const masterCommit=masterIndex>=0?data.commits[masterIndex]:null;const masterTitle=masterCommit?(masterCommit.badgeDetail||masterCommit.badge||'Upstream base'):'Upstream base';const masterBadge=masterCommit?(masterCommit.badge||'Upstream base'):'Upstream base';updateDividerToggle=()=>{};data.commits.forEach((commit,index)=>{if(commit.isMaster&&!dividerInserted){dividerInserted=true;const divider=document.createElement('div');divider.className='git-master-divider';divider.title='点击展开或折叠 '+masterTitle+' 之前的历史提交';const tag=document.createElement('span');tag.className='divider-tag';tag.textContent='✦ '+masterBadge.toUpperCase();const toggle=document.createElement('span');toggle.className='divider-toggle';updateDividerToggle=function(){if(upstreamCount>0){toggle.innerHTML=upstreamCollapsed?('<span class="divider-arrow">▶</span> 展开更早历史 ('+upstreamCount+')'):('<span class="divider-arrow">▼</span> 折叠更早历史 ('+upstreamCount+')');toggle.title=upstreamCollapsed?('点击展开 '+masterTitle+' 之前的 '+upstreamCount+' 个历史提交'):('点击折叠 '+masterTitle+' 之前的 '+upstreamCount+' 个历史提交')}else{toggle.innerHTML='<span class="divider-arrow">✦</span> '+masterBadge;toggle.title=masterTitle+' commit'}};updateDividerToggle();divider.append(tag,toggle);divider.onclick=()=>{upstreamCollapsed=!upstreamCollapsed;entries.querySelectorAll('.entry.upstream-commit').forEach(btn=>{if(upstreamCollapsed)btn.classList.add('collapsed');else btn.classList.remove('collapsed')});updateDividerToggle()};entries.append(divider)}const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;if(commit.isMaster){button.classList.add('master-commit');button.title='Upstream base: '+(commit.badgeDetail||commit.shortHash);const badge=document.createElement('span');badge.className='master-badge';badge.textContent='✦ '+(commit.badge||'Upstream base');name.append(badge)}else if(masterIndex>=0&&index>masterIndex){button.classList.add('upstream-commit');if(upstreamCollapsed)button.classList.add('collapsed')}name.append(document.createTextNode(commit.subject));icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)})}
+function renderCommitList(data){entries.replaceChildren();let dividerInserted=false,masterIndex=-1;data.commits.forEach((commit,index)=>{if(commit.isMaster&&masterIndex===-1)masterIndex=index});gitMasterIndex=masterIndex;const upstreamCount=masterIndex>0?data.commits.length-(masterIndex+1):0;const masterCommit=masterIndex>0?data.commits[masterIndex]:null;const masterTitle=masterCommit?(masterCommit.badgeDetail||masterCommit.badge||'Upstream base'):'Upstream base';const masterBadge=masterCommit?(masterCommit.badge||'Upstream base'):'Upstream base';updateDividerToggle=()=>{};data.commits.forEach((commit,index)=>{if(commit.isMaster&&!dividerInserted&&index>0){dividerInserted=true;const divider=document.createElement('div');divider.className='git-master-divider';divider.title='点击展开或折叠 '+masterTitle+' 之前的历史提交';const tag=document.createElement('span');tag.className='divider-tag';tag.textContent='✦ '+masterBadge.toUpperCase();const toggle=document.createElement('span');toggle.className='divider-toggle';updateDividerToggle=function(){if(upstreamCount>0){toggle.innerHTML=upstreamCollapsed?('<span class="divider-arrow">▶</span> 展开更早历史 ('+upstreamCount+')'):('<span class="divider-arrow">▼</span> 折叠更早历史 ('+upstreamCount+')');toggle.title=upstreamCollapsed?('点击展开 '+masterTitle+' 之前的 '+upstreamCount+' 个历史提交'):('点击折叠 '+masterTitle+' 之前的 '+upstreamCount+' 个历史提交')}else{toggle.innerHTML='<span class="divider-arrow">✦</span> '+masterBadge;toggle.title=masterTitle+' commit'}};updateDividerToggle();divider.append(tag,toggle);divider.onclick=()=>{upstreamCollapsed=!upstreamCollapsed;entries.querySelectorAll('.entry.upstream-commit').forEach(btn=>{if(upstreamCollapsed)btn.classList.add('collapsed');else btn.classList.remove('collapsed')});updateDividerToggle()};entries.append(divider)}const button=document.createElement('button'),icon=document.createElement('span'),info=document.createElement('span'),name=document.createElement('strong'),meta=document.createElement('small');button.className='entry';button.dataset.hash=commit.hash;button.dataset.index=index;if(commit.isMaster&&index>0){button.classList.add('master-commit');button.title='Upstream base: '+(commit.badgeDetail||commit.shortHash);const badge=document.createElement('span');badge.className='master-badge';badge.textContent='✦ '+(commit.badge||'Upstream base');name.append(badge)}else if(masterIndex>0&&index>masterIndex){button.classList.add('upstream-commit');if(upstreamCollapsed)button.classList.add('collapsed')}name.append(document.createTextNode(commit.subject));icon.className='icon git';icon.setAttribute('aria-hidden','true');info.className='entry-info git-entry-info';meta.className='git-entry-meta';meta.textContent=commit.shortHash+'  '+commit.date;info.append(name,meta);button.append(icon,info);button.onclick=()=>openCommitRange(index);entries.append(button)})}
 async function showGit(target,branch,action='git'){viewMode='git';localStorage.setItem(lastViewModeKey,viewMode);presets.value='__git__';upstreamCollapsed=true;try{const rootTarget=target||localStorage.getItem(lastGitRootKey)||currentDirectory||'';const rememberedBranch=branch||(rootTarget?(localStorage.getItem(gitBranchKey(rootTarget))||getTopBranchForRoot(rootTarget)):null);logPortal('info',action==='refresh'?'REFRESH_GIT':'GIT_VIEW',rootTarget,rememberedBranch||'HEAD');let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget);if(rememberedBranch)url+='&branch='+encodeURIComponent(rememberedBranch);if(action)url+='&action='+encodeURIComponent(action);const data=await request(url);gitRoot=data.root;gitCommits=data.commits;gitStartIndex=0;gitMasterIndex=-1;currentDirectory=data.root;currentParent=null;recordPathHistory(data.root);localStorage.setItem(lastGitRootKey,data.root);if(data.branch){localStorage.setItem(gitBranchKey(data.root),data.branch);recordBranchHistory(data.root,data.branch)}directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);pathInput.value=data.root;gitBranch.replaceChildren();const branchHist=loadBranchHistory(data.root)||{},now=Date.now(),rankedBranches=[],otherBranches=[];(data.branches||[]).forEach(item=>{const hist=branchHist[item.name];if(hist)rankedBranches.push({item,score:getFrecencyScore(hist,now),hist});else otherBranches.push(item)});rankedBranches.sort((a,b)=>b.score-a.score);if(rankedBranches.length>0){const favGroup=document.createElement('optgroup');favGroup.label='★ 常用分支 (Frecency)';rankedBranches.forEach(({item,hist})=>{const option=document.createElement('option');option.value=item.name;option.textContent=(item.label||item.name)+' ('+hist.count+'次 · '+formatRelativeTime(hist.last)+')';favGroup.append(option)});gitBranch.append(favGroup);if(otherBranches.length>0){const otherGroup=document.createElement('optgroup');otherGroup.label='其他本地分支';otherBranches.forEach(item=>{const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;otherGroup.append(option)});gitBranch.append(otherGroup)}}else{(data.branches||[]).forEach(item=>{const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;gitBranch.append(option)})}if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';gitBranch.hidden=false;renderCommitList(data);syncCommitCountOptions(gitMasterIndex);commitCount.hidden=false;commitView.hidden=false;current=null;content.value='';updateLineNumbers();content.disabled=true;content.readOnly=false;save.disabled=true;copy.disabled=true;file.textContent='Select a commit to view its patch';updatePreviewState();logPortal('info','COMMITS_LOADED',data.root,data.branch,data.commits.length+' commits');if(data.commits.length)await openCommitRange(0);else{setGitDownloadTarget([]);setStatus('No commits found on branch '+(data.branch||''),'ok')}}catch(error){logPortal('error','GIT_FAILED',error.message);setStatus(error.message+' Browse a Git repository first.','error')}}
-async function openCommitRange(startIndex){try{if(!gitRoot||!gitCommits.length)return;gitStartIndex=startIndex;let count=1;if(commitCount.value==='branch'){count=gitMasterIndex>0?Math.max(1,gitMasterIndex-startIndex):1}else{count=Number(commitCount.value)||1}count=Math.max(1,Math.min(count,gitCommits.length-startIndex));if(gitMasterIndex>=0&&startIndex+count>gitMasterIndex&&upstreamCollapsed){upstreamCollapsed=false;entries.querySelectorAll('.entry.upstream-commit').forEach(btn=>btn.classList.remove('collapsed'));updateDividerToggle()}const selected=gitCommits.slice(startIndex,startIndex+count);highlightActiveCommitRange(startIndex,count);setStatus('Loading commit diff...','');logPortal('info','SHOW_COMMIT',gitRoot,'hashes='+selected.map(c=>c.shortHash).join(','),'count='+count,'view='+commitView.value);const params=new URLSearchParams({path:gitRoot,commits:selected.map(commit=>commit.hash).join(','),view:commitView.value,patch:commitView.value});const data=await request(base+'/api/git/show?'+params);current=null;content.value=data.content;updateLineNumbers();content.disabled=false;content.readOnly=true;const modeSuffix=data.mode==='stat'?' + stat':(data.mode==='patch'||data.patch?' + patch':' log');file.textContent=data.path+' @ '+selected.length+' commit'+(selected.length===1?'':'s')+modeSuffix;save.disabled=true;copy.disabled=false;setGitDownloadTarget(selected);setStatus('Read-only commit view','ok');highlightActiveCommitRange(startIndex,count)}catch(error){logPortal('error','SHOW_COMMIT_FAILED',error.message);setStatus(error.message,'error')}}
+async function openCommitRange(startIndex){try{if(!gitRoot||!gitCommits.length)return;gitStartIndex=startIndex;let count=1;if(commitCount.value==='branch'){count=gitMasterIndex>0?Math.max(1,gitMasterIndex-startIndex):1}else{count=Number(commitCount.value)||1}count=Math.max(1,Math.min(count,gitCommits.length-startIndex));if(gitMasterIndex>0&&startIndex+count>gitMasterIndex&&upstreamCollapsed){upstreamCollapsed=false;entries.querySelectorAll('.entry.upstream-commit').forEach(btn=>btn.classList.remove('collapsed'));updateDividerToggle()}const selected=gitCommits.slice(startIndex,startIndex+count);highlightActiveCommitRange(startIndex,count);setStatus('Loading commit diff...','');logPortal('info','SHOW_COMMIT',gitRoot,'hashes='+selected.map(c=>c.shortHash).join(','),'count='+count,'view='+commitView.value);const params=new URLSearchParams({path:gitRoot,commits:selected.map(commit=>commit.hash).join(','),view:commitView.value,patch:commitView.value});const data=await request(base+'/api/git/show?'+params);current=null;content.value=data.content;updateLineNumbers();content.disabled=false;content.readOnly=true;const modeSuffix=data.mode==='stat'?' + stat':(data.mode==='patch'||data.patch?' + patch':' log');file.textContent=data.path+' @ '+selected.length+' commit'+(selected.length===1?'':'s')+modeSuffix;save.disabled=true;copy.disabled=false;setGitDownloadTarget(selected);setStatus('Read-only commit view','ok');highlightActiveCommitRange(startIndex,count)}catch(error){logPortal('error','SHOW_COMMIT_FAILED',error.message);setStatus(error.message,'error')}}
 async function refreshCurrent(){logPortal('info','REFRESH_START','mode='+viewMode);refreshButton.disabled=true;if(refreshHead)refreshHead.disabled=true;setStatus('Refreshing...','');try{if(viewMode==='git'){if(!gitRoot)return;const rootTarget=gitRoot,currentBranch=gitBranch.value||localStorage.getItem(gitBranchKey(rootTarget));let url=base+'/api/git/commits?path='+encodeURIComponent(rootTarget)+'&action=refresh';if(currentBranch)url+='&branch='+encodeURIComponent(currentBranch);const data=await request(url);logPortal('info','REFRESH_GIT_COMMITS',data.root,data.branch,data.commits.length+' commits');gitCommits=data.commits;directory.textContent=gitDirectoryLabel('Recent commits: '+data.root,data.branch);gitBranch.replaceChildren();(data.branches||[]).forEach(item=>{const option=document.createElement('option');option.value=item.name;option.textContent=item.label||item.name;gitBranch.append(option)});if(data.branch&&!Array.from(gitBranch.options).some(option=>option.value===data.branch)){const option=document.createElement('option');option.value=data.branch;option.textContent=data.branch;gitBranch.prepend(option)}gitBranch.value=data.branch||'';renderCommitList(data);syncCommitCountOptions(gitMasterIndex);if(data.commits.length){if(gitStartIndex>=data.commits.length)gitStartIndex=0;await openCommitRange(gitStartIndex);setStatus('Refreshed commits','ok')}else{current=null;content.value='';updateLineNumbers();file.textContent='No commits found';setGitDownloadTarget([]);setStatus('No commits found on branch '+(data.branch||''),'ok')}}else{const dir=currentDirectory||(current?current.path.slice(0,current.path.lastIndexOf('/')):null)||pathInput.value;if(!dir)return;const activeFilePath=current?current.path:(localStorage.getItem(lastFileKeyFor(dir))||null);await browse(dir,'refresh');if(activeFilePath){try{await openFile(activeFilePath,'refresh');setStatus('Refreshed','ok')}catch(error){logPortal('warn','REFRESH_FILE_LOST',activeFilePath,error.message);localStorage.removeItem(lastFileKeyFor(dir));localStorage.removeItem(lastFileKey);const preset=presetForPath(dir);if(preset)localStorage.removeItem(lastFileKeyForPreset(preset));current=null;content.value='';updateLineNumbers();content.disabled=true;file.textContent='Choose a text file';save.disabled=true;copy.disabled=true;setDownloadTarget(dir,'directory');setStatus('File no longer accessible: '+error.message,'error')}}else{setStatus('Refreshed','ok')}}logPortal('info','REFRESH_COMPLETED','mode='+viewMode)}catch(error){logPortal('error','REFRESH_FAILED',error.message);setStatus(error.message,'error')}finally{refreshButton.disabled=false;if(refreshHead)refreshHead.disabled=false}}
 function markDirty(){if(!current||content.readOnly)return;const entry=Array.from(entries.querySelectorAll('button[data-path]')).find(button=>button.dataset.path===current.path);if(entry){const meta=entry.querySelector('.entry-meta');if(meta)meta.textContent='Modified, not saved'}setStatus('Modified, not saved')}
 async function copyContents(){const text=content.value;if(!text){setStatus('Nothing to copy','');return}try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(text);setStatus('Copied','ok');return}throw new Error('fallback')}catch(_){const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.left='-9999px';ta.style.top='0';document.body.appendChild(ta);ta.focus();ta.select();const ok=document.execCommand('copy');document.body.removeChild(ta);if(ok)setStatus('Copied','ok');else setStatus('Copy failed','error')}}
