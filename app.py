@@ -274,26 +274,33 @@ def format_upstream_tree(ref_name):
         clean = clean[:-5].strip()
         is_base = True
 
-    if "bpf-next" in clean:
+    clean_lower = clean.lower()
+    if "bpf-next" in clean_lower:
         tree = "bpf-next tree"
     elif clean.startswith("bpf/") or clean == "bpf":
-        tree = "bpf tree"
-    elif "tip" in clean and ("sched" in clean or "schedule" in clean):
-        tree = "tip/schedule tree"
+        tree = "bpf (fixes) tree"
+    elif "tip" in clean_lower and ("sched" in clean_lower or "schedule" in clean_lower):
+        tree = "tip/sched tree"
     elif clean.startswith("tip/") or clean == "tip":
-        tree = "tip/schedule tree"
+        tree = "tip tree"
     elif clean in ("sched-core", "sched/core"):
-        tree = "tip/schedule tree"
-    elif "linux-next" in clean:
+        tree = "tip/sched tree"
+    elif any(k in clean_lower for k in ["sched_ext", "sched-ext", "tj"]):
+        m = re.search(r'for-[\d.]+(-fixes)?', clean, re.I)
+        ver_str = f" ({m.group(0)})" if m else ""
+        tree = f"tj/sched_ext{ver_str} tree"
+    elif "mm-" in clean_lower or "akpm" in clean_lower:
+        tree = f"mm ({clean}) tree"
+    elif "linux-next" in clean_lower:
         tree = "linux-next tree"
-    elif "net-next" in clean:
+    elif "net-next" in clean_lower:
         tree = "net-next tree"
     elif clean.startswith("net/") or clean == "net":
         tree = "net tree"
     elif is_linus_ref(clean) or clean in ("origin/master", "master", "main", "origin/main", "upstream/master"):
         tree = "master tree"
     else:
-        tree = clean
+        tree = f"{clean} tree"
 
     return f"{tree} base" if is_base else tree
 
@@ -304,7 +311,7 @@ _MASTER_BASE_CACHE = {}
 def find_master_base(root, target_ref, active_branch=None):
     ref_to_check = active_branch if target_ref == "HEAD" and active_branch else target_ref
     clean_target = (ref_to_check or "").removeprefix("refs/heads/").removeprefix("refs/remotes/").strip()
-    if not clean_target or clean_target in ("origin/master", "origin/main", "upstream/master", "upstream/main"):
+    if not clean_target or clean_target in ("origin/master", "origin/main", "upstream/master", "upstream/main", "master", "main"):
         return None, None
 
     cache_key = (str(root), clean_target)
@@ -312,23 +319,9 @@ def find_master_base(root, target_ref, active_branch=None):
         return _MASTER_BASE_CACHE[cache_key]
 
     target_lower = clean_target.lower()
-    candidate_list = [
-        "refs/remotes/origin/master",
-        "refs/remotes/origin/main",
-        "refs/remotes/upstream/master",
-        "refs/remotes/upstream/main",
-        "refs/remotes/tip/sched/core",
-        "refs/remotes/tip/schedule",
-        "refs/remotes/tip/sched-core",
-        "refs/remotes/tip/master",
-        "refs/remotes/bpf-next/master",
-        "refs/remotes/bpf/master",
-        "refs/remotes/net-next/master",
-        "refs/remotes/net/master",
-        "refs/heads/master",
-        "refs/heads/main",
-    ]
 
+    candidate_refs = []
+    # 1. Discover tracking upstream ref
     try:
         res = subprocess.run(
             ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "--symbolic-full-name", f"{target_ref}@{{u}}"],
@@ -337,32 +330,91 @@ def find_master_base(root, target_ref, active_branch=None):
             timeout=0.3,
         )
         if res.returncode == 0 and res.stdout.strip():
-            tracking_ref = res.stdout.strip()
-            if tracking_ref not in candidate_list:
-                candidate_list.insert(0, tracking_ref)
+            candidate_refs.append((30, res.stdout.strip(), "tracking"))
     except (OSError, subprocess.TimeoutExpired):
         pass
 
+    # 2. Dynamic discovery from git repository refs
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(root), "for-each-ref", "--format=%(refname)", "refs/remotes/", "refs/heads/", "refs/codex/"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                ref = line.strip()
+                if not ref:
+                    continue
+                clean = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/").removeprefix("refs/codex/")
+                if clean == clean_target or ref == target_ref:
+                    continue
+
+                pref = 0
+                cat = None
+                if re.search(r"(tj|sched_ext|sched-ext).*(for-[\d.]+|fixes|for-next)|for-[\d.]+(-fixes)?", ref, re.I):
+                    cat = "sched_ext"
+                    pref = 20 if any(k in target_lower for k in ["sched_ext", "sched-ext", "scx", "idle"]) else 10
+                elif re.search(r"tip.*(sched|core|master)|sched/(core|urgent|ext)|sched-core", ref, re.I):
+                    cat = "tip"
+                    pref = 20 if ("sched" in target_lower and "ext" not in target_lower) or "tip" in target_lower else 10
+                elif re.search(r"(akpm|mm).*(everything|stable|unstable|nonmm)|mm-(everything|stable|unstable)", ref, re.I):
+                    cat = "mm"
+                    pref = 20 if "mm" in target_lower else 10
+                elif re.search(r"bpf(-next)?/(master|fixes|for-next)|/bpf/master|/bpf-next/master", ref, re.I):
+                    cat = "bpf"
+                    pref = 20 if "bpf" in target_lower else 10
+                elif re.search(r"net(-next)?/(master|main|fixes)", ref, re.I):
+                    cat = "net"
+                    pref = 20 if "net" in target_lower else 10
+                elif re.search(r"refs/remotes/(origin|upstream)/(master|main)$", ref) or re.search(r"refs/heads/(master|main)$", ref):
+                    cat = "mainline"
+                    pref = 5
+                elif re.search(r"refs/remotes/(origin|upstream)/linux-(?:[6-9]|\d{2,})\.[\d.]+\.y$", ref):
+                    cat = "stable"
+                    pref = 3
+
+                if cat:
+                    candidate_refs.append((pref, ref, cat))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    # 3. Fallback static candidates if no refs discovered
+    if not candidate_refs:
+        fallback_list = [
+            (5, "refs/remotes/origin/master", "mainline"),
+            (5, "refs/remotes/upstream/master", "mainline"),
+            (10, "refs/remotes/tip/sched/core", "tip"),
+            (10, "refs/remotes/bpf/master", "bpf"),
+            (10, "refs/remotes/bpf-next/master", "bpf"),
+            (2, "refs/heads/master", "mainline"),
+        ]
+        candidate_refs.extend(fallback_list)
+
+    # Sort candidates by preference descending
+    candidate_refs.sort(key=lambda x: x[0], reverse=True)
+
     best_candidate = None
     min_dist = None
-    best_pref = -1
 
-    for ref in candidate_list:
+    for pref, ref, cat in candidate_refs:
         try:
             res = subprocess.run(
                 ["git", "-C", str(root), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
                 capture_output=True,
                 text=True,
-                timeout=0.3,
+                timeout=0.25,
             )
             if res.returncode != 0 or not res.stdout.strip():
                 continue
             ref_commit = res.stdout.strip()
+
             mb = subprocess.run(
                 ["git", "-C", str(root), "merge-base", target_ref, ref_commit],
                 capture_output=True,
                 text=True,
-                timeout=0.4,
+                timeout=0.35,
             )
             if mb.returncode != 0 or not mb.stdout.strip():
                 continue
@@ -372,31 +424,22 @@ def find_master_base(root, target_ref, active_branch=None):
                 ["git", "-C", str(root), "rev-list", "--count", f"{base_commit}..{target_ref}"],
                 capture_output=True,
                 text=True,
-                timeout=0.4,
+                timeout=0.35,
             )
             if cnt.returncode != 0 or not cnt.stdout.strip():
                 continue
             dist = int(cnt.stdout.strip())
 
-            found_ref = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/")
+            # Format human-friendly label
+            clean_name = ref.removeprefix("refs/remotes/").removeprefix("refs/heads/").removeprefix("refs/codex/audit/").removeprefix("refs/codex/check/").removeprefix("refs/codex/")
+            clean_name = re.sub(r'-\d{8,}$', '', clean_name)
+            label = clean_name if base_commit == ref_commit else f"{clean_name} base"
 
-            pref = 0
-            if "tip" in target_lower and "tip" in ref.lower():
-                pref = 10
-            elif "bpf" in target_lower and "bpf" in ref.lower():
-                pref = 10
-            elif "net" in target_lower and "net" in ref.lower():
-                pref = 10
-            elif "origin/master" in ref:
-                pref = 5
-            elif "master" in ref:
-                pref = 2
-
-            if min_dist is None or dist < min_dist or (dist == min_dist and pref > best_pref):
+            if dist > 0 and (min_dist is None or dist < min_dist):
                 min_dist = dist
-                best_pref = pref
-                label = found_ref if base_commit == ref_commit else f"{found_ref} base"
-                best_candidate = (base_commit, label, dist)
+                best_candidate = (base_commit, label, dist, cat)
+                if dist <= 15 and pref >= 15:
+                    break
         except (OSError, subprocess.TimeoutExpired, ValueError):
             continue
 
@@ -678,6 +721,8 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(request.query)
             raw_path = query.get("path", [None])[0]
             action = query.get("action", ["list"])[0]
+            if action == "refresh":
+                _MASTER_BASE_CACHE.clear()
             root = resolve_git_root(raw_path)
             branches = git_branches_for(root)
             active_branch = git_branch_for(root)
@@ -706,7 +751,7 @@ class Handler(BaseHTTPRequestHandler):
                 branches.insert(0, {"name": "HEAD", "label": active_branch, "committerDate": 0, "relative": ""})
 
             output = git_output([
-                "git", "-C", str(root), "log", "-30",
+                "git", "-C", str(root), "log", "-50",
                 "--date=format:%m-%d %H:%M:%S", "--format=%H%x1f%h%x1f%ad%x1f%s%x1f%D",
                 target_ref, "--",
             ])
